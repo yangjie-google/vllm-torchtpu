@@ -278,7 +278,7 @@ class _FakeLMHead(nn.Module):
 def fake_sublayers(monkeypatch):
     for name in (
         "QwenGatedDeltaNetAttention",
-        "Qwen4ExpQSAAttention",
+        "Qwen4ExpAttention",
         "Qwen3NextSparseMoeBlock",
     ):
         monkeypatch.setattr(qwen4_model, name, _FakeSublayer)
