@@ -31,6 +31,14 @@ from .constants import (
     SOLVE_SCHEMA,
     UNIT_GIGA,
 )
+from .families import (
+    attach_reference_report,
+    build_bound_families_by_concurrency,
+    ordered_candidates_by_concurrency,
+    parse_layout,
+    reference_layout_report,
+    strict_rank,
+)
 from .schema import (
     CeilingRow,
     ParetoPoint,
@@ -61,14 +69,20 @@ __all__ = [
     "ProvenancePayload",
     "SolvePayload",
     "TopKEntry",
+    "attach_reference_report",
+    "build_bound_families_by_concurrency",
     "build_solve_payload",
     "emit_ceiling_rows",
     "format_host_count",
     "format_parallelism",
     "format_solve_json",
     "format_submodule_parallelism",
+    "ordered_candidates_by_concurrency",
+    "parse_layout",
     "pool_label",
     "pool_slice_summary",
+    "reference_layout_report",
+    "strict_rank",
     "top_layout_roles",
     "top_layouts",
 ]
@@ -433,6 +447,21 @@ def build_solve_payload(
             "pd_ratio": pins_map.get("pd_ratio", pins_map.get("pd")),
         },
     }
+    ordered_by_conc = ordered_candidates_by_concurrency(plan, top_k)
+    payload["concurrency_top_k"] = {
+        str(concurrency): [
+            {
+                "frontier_role": role,
+                "margin_vs_rank1_pct": margin,
+                "point": asdict(point),
+            }
+            for point, role, margin in top_layout_roles(
+                conc_pts, plan.frontier, sort_by=plan.sort_by
+            )
+        ]
+        for concurrency, conc_pts in ordered_by_conc.items()
+    }
+    payload["bound_families_by_concurrency"] = build_bound_families_by_concurrency(plan)
     if dtypes is not None:
         payload["dtypes"] = asdict(dtypes)
     return payload

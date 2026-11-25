@@ -361,7 +361,10 @@ def test_report_honest_analytical_headings_and_excludes_ruled_out_frontier(
     assert "Executive Recommendation" not in html_base
     assert "Recommended Launch Command" not in html_base
     assert "Best Parallelism:" not in html_base
-    assert 'id="bound-families-table"' not in html_base
+    assert 'id="bound-families-table"' in html_base
+    no_families_payload = dict(sample_payload)
+    no_families_payload.pop("bound_families_by_concurrency", None)
+    assert 'id="bound-families-table"' not in render_html(no_families_payload)
 
     payload = copy.deepcopy(sample_payload)
     ruled_out_pts = []

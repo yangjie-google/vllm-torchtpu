@@ -1481,6 +1481,12 @@ def _format_bound_family_members(
     for member in members:
         if isinstance(member, Mapping) and "decode_pool" in member:
             labels.append(_pools_display(member, has_moe=has_moe, chip=chip))
+        elif isinstance(member, Mapping) and isinstance(member.get("pool"), Mapping):
+            labels.append(
+                _pool_inline_label(
+                    _as_mapping(member.get("pool")), has_moe=has_moe, chip=chip
+                )
+            )
         elif isinstance(member, Mapping) and "tp" in member:
             labels.append(_pool_inline_label(member, has_moe=has_moe, chip=chip))
         elif member is not None:
@@ -1501,8 +1507,18 @@ def _render_bound_family_row(
     """Render one bound-ordered candidate family row for analytical handoff."""
     rank = _as_int(entry.get("rank"), rank_idx)
     family_label = _format_bound_family_label(entry, has_moe=has_moe, chip=chip)
-    min_bound_tpot = _as_float(entry.get("min_bound_tpot_ms"))
-    min_bound_ttft = _as_float(entry.get("min_bound_ttft_ms"))
+    min_bound_tpot_raw = entry.get("min_bound_tpot_ms")
+    min_bound_ttft_raw = entry.get("min_bound_ttft_ms")
+    min_bound_tpot_str = (
+        f"{_as_float(min_bound_tpot_raw):.2f}"
+        if min_bound_tpot_raw is not None
+        else "-"
+    )
+    min_bound_ttft_str = (
+        f"{_as_float(min_bound_ttft_raw):.1f}"
+        if min_bound_ttft_raw is not None
+        else "-"
+    )
     env_tpot_raw = entry.get("min_envelope_tpot_ms")
     env_ttft_raw = entry.get("min_envelope_ttft_ms")
     env_tpot_str = f"{_as_float(env_tpot_raw):.2f}" if env_tpot_raw is not None else "-"
@@ -1516,8 +1532,8 @@ def _render_bound_family_row(
         f"<td><code>c={_escape(conc_key)}</code></td>"
         f"<td>#{rank}</td>"
         f"<td><code>{_escape(family_label)}</code></td>"
-        f"<td>{min_bound_tpot:.2f}</td>"
-        f"<td>{min_bound_ttft:.1f}</td>"
+        f"<td>{min_bound_tpot_str}</td>"
+        f"<td>{min_bound_ttft_str}</td>"
         f"<td>{env_tpot_str} / {env_ttft_str}</td>"
         f"<td><code>{_escape(binding)}</code></td>"
         f"<td><code>{verdict_str}</code></td>"
