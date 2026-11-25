@@ -348,3 +348,120 @@ def test_qsa_attention_op_traces_with_symbolic_fake_tensors() -> None:
         )
         assert out.shape == (num_tokens, H, D)
         assert out.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("pages_per_req", [0, 1, 2])
+def test_qsa_narrow_table_returns_dense_without_topk_crash(pages_per_req: int) -> None:
+    """When total_blocks <= topk_blocks (including 0), _qsa_attention returns
+    dense_out cleanly without calling lax.top_k or dividing by zero."""
+    n = 6
+    dense = jnp.arange(n * H * D, dtype=jnp.float32).reshape(n, H, D)
+    num_pages = max(1, 1 + pages_per_req)
+    pool = jnp.zeros((num_pages, PAGE, 2 * KVH, 1, 128), jnp.float32)
+    tables = jnp.arange(1, 1 + pages_per_req, dtype=jnp.int32)
+    out, _ = _qsa_attention(
+        jnp.ones((n, H, D), jnp.float32),
+        jnp.ones((n, IH, DI), jnp.float32),
+        jnp.ones((n, DI), jnp.float32),
+        dense,
+        jnp.arange(n, dtype=jnp.int32),
+        jnp.asarray([0, n], jnp.int32),
+        jnp.asarray([n], jnp.int32),
+        tables,
+        pool,
+        pool,
+        jnp.ones((64, ROTARY), jnp.float32),
+        jnp.zeros((DI,), jnp.float32),
+        jnp.ones((2,), jnp.float32),
+        **_QSA_KWARGS,
+    )
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(dense))
+
+
+@pytest.mark.parametrize("verify_batch", [4, 8])
+def test_qsa_grouped_verify_matches_per_token_on_misaligned_mixed_batch(
+    verify_batch: int,
+) -> None:
+    """Cursor grouped verify is bit-exact against per_token (verify_batch=1)
+    on random non-constant inputs across misaligned decode+verify+prefill runs."""
+    rng = np.random.default_rng(7)
+    pages_per_req = 12
+    # 5 requests with misaligned query lengths: 1 (decode), 4 (verify), 3, 4, 6.
+    num_reqs = 5
+    q_lens = [1, 4, 3, 4, 6]
+    hist_lens = [18, 22, 14, 25, 19]
+    num_pages = 1 + num_reqs * pages_per_req
+    tables = np.array(
+        [
+            [1 + r * pages_per_req + i for i in range(pages_per_req)]
+            for r in range(num_reqs)
+        ],
+        dtype=np.int32,
+    )
+    main_pool = jnp.asarray(
+        rng.standard_normal((num_pages, PAGE, 2 * KVH, 1, 128)).astype(np.float32)
+    )
+    index_pool = jnp.asarray(
+        rng.standard_normal((num_pages, PAGE, 2 * KVH, 1, 128)).astype(np.float32)
+    )
+    cos_sin = jnp.asarray(rng.standard_normal((64, ROTARY)).astype(np.float32))
+    k_norm = jnp.asarray(rng.standard_normal((DI,)).astype(np.float32) * 0.1)
+
+    total_real = sum(q_lens)
+    pad = 5
+    t = total_real + pad
+    qsl = np.cumsum([0] + q_lens, dtype=np.int32)
+    positions = np.concatenate(
+        [
+            np.arange(hist_lens[r], hist_lens[r] + q_lens[r], dtype=np.int32)
+            for r in range(num_reqs)
+        ]
+        + [np.zeros(pad, dtype=np.int32)]
+    )
+    seq_lens = np.array([h0 + ql for h0, ql in zip(hist_lens, q_lens)], dtype=np.int32)
+
+    q = jnp.asarray(rng.standard_normal((t, H, D)).astype(np.float32))
+    iq = jnp.asarray(rng.standard_normal((t, IH, DI)).astype(np.float32))
+    rk = jnp.asarray(rng.standard_normal((t, DI)).astype(np.float32))
+    dense = jnp.asarray(rng.standard_normal((t, H, D)).astype(np.float32))
+
+    common = dict(**_QSA_KWARGS, token_batch=16, block_tile=4)
+    with jax.default_matmul_precision("highest"):
+        out_ref, pool_ref = _qsa_attention(
+            q,
+            iq,
+            rk,
+            dense,
+            jnp.asarray(positions),
+            jnp.asarray(qsl),
+            jnp.asarray(seq_lens),
+            jnp.asarray(tables.reshape(-1)),
+            main_pool,
+            index_pool,
+            cos_sin,
+            k_norm,
+            jnp.ones(2, jnp.float32),
+            verify_batch=1,
+            **common,
+        )
+        out_grp, pool_grp = _qsa_attention(
+            q,
+            iq,
+            rk,
+            dense,
+            jnp.asarray(positions),
+            jnp.asarray(qsl),
+            jnp.asarray(seq_lens),
+            jnp.asarray(tables.reshape(-1)),
+            main_pool,
+            index_pool,
+            cos_sin,
+            k_norm,
+            jnp.ones(2, jnp.float32),
+            verify_batch=verify_batch,
+            **common,
+        )
+    np.testing.assert_allclose(
+        np.asarray(out_grp), np.asarray(out_ref), rtol=1e-5, atol=1e-5
+    )
+    np.testing.assert_array_equal(np.asarray(pool_grp), np.asarray(pool_ref))
