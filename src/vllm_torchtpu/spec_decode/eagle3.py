@@ -239,6 +239,8 @@ class Eagle3Proposer:
         self._draft_tp_matches_target = draft_tp == target_tp
         # Lazily resolved by _draft_has_moe once the draft model exists.
         self._draft_has_moe_cache: bool | None = None
+        # Lazily resolved by _uses_target_hc_residual.
+        self._uses_target_hc_residual_cache: bool | None = None
         logger.info(
             "%s draft parallelism: %s (draft_tp=%s).",
             self.speculative_config.method,
@@ -1285,6 +1287,23 @@ class Eagle3Proposer:
                         target_hidden_states = self.draft_model.combine_hidden_states(
                             chunk.hidden_states
                         )
+                elif self._uses_target_hc_residual():
+                    if len(chunk.aux_hidden_states) != 1:
+                        raise RuntimeError(
+                            "HC-residual MTP target must emit exactly 1 aux "
+                            "hidden state tensor, got "
+                            f"{len(chunk.aux_hidden_states)}."
+                        )
+                    target_hidden_states = chunk.aux_hidden_states[0]
+                    if self.draft_model is not None:
+                        expected_width = self._draft_input_hidden_size()
+                        if target_hidden_states.shape[-1] != expected_width:
+                            raise RuntimeError(
+                                "HC-residual MTP target aux hidden state width "
+                                f"{target_hidden_states.shape[-1]} does not "
+                                f"match expected draft input width "
+                                f"{expected_width}."
+                            )
                 else:
                     # MTP: does not use combine_hidden_states
                     target_hidden_states = chunk.hidden_states
@@ -2191,6 +2210,38 @@ class Eagle3Proposer:
             )
         return hidden_size
 
+    def _uses_target_hc_residual(self) -> bool:
+        """Whether the target emits a wide HC residual (`[T, hc_mult * H]`) for MTP.
+
+        Targets opt in with `mtp_emits_aux_hidden_state = True` so models that
+        collapse HC streams in `forward()` (for example DeepSeek-V4) keep using
+        `chunk.hidden_states`.
+        """
+        cached = getattr(self, "_uses_target_hc_residual_cache", None)
+        if cached is not None:
+            return cached
+        result = False
+        if self.speculative_config.method == "mtp":
+            model_config = getattr(self.vllm_config, "model_config", None)
+            if model_config is not None and hasattr(model_config, "architecture"):
+                from vllm.model_executor.model_loader.utils import get_model_cls
+
+                target_cls = get_model_cls(model_config)
+                result = bool(getattr(target_cls, "mtp_emits_aux_hidden_state", False))
+        self._uses_target_hc_residual_cache = result
+        return result
+
+    def _draft_input_hidden_size(self) -> int:
+        """Width of the hidden state fed to the draft forward and loop carry."""
+        hidden_size = self._draft_hidden_size()
+        if not self._uses_target_hc_residual():
+            return hidden_size
+        draft_cfg = self.speculative_config.draft_model_config
+        hc_mult = getattr(getattr(draft_cfg, "hf_config", None), "hc_mult", None)
+        if hc_mult is None:
+            hc_mult = getattr(getattr(draft_cfg, "hf_text_config", None), "hc_count", 1)
+        return hidden_size * int(hc_mult or 1)
+
     def _draft_uses_aux_hidden_state(self) -> bool:
         """Whether this draft checkpoint feeds combine_hidden_states the
         concatenation of several target aux hidden-state layers.
@@ -2388,8 +2439,9 @@ class Eagle3Proposer:
             if runner.uses_mrope
             else token_positions
         )
+        draft_input_hidden = self._draft_input_hidden_size()
         target_hidden_states = torch.zeros(
-            (bucket, self._draft_hidden_size()),
+            (bucket, draft_input_hidden),
             dtype=runner._hidden_states_dtype,
             device=runner.device,
         )
@@ -2467,7 +2519,7 @@ class Eagle3Proposer:
                 device=runner.device,
             ),
             loop_hidden=torch.zeros(
-                (p, draft_hidden), dtype=dtype, device=runner.device
+                (p, draft_input_hidden), dtype=dtype, device=runner.device
             ),
             # Loop-step metadata mirrors propose()'s per-chunk loop tensors.
             loop_query_start_loc=torch.from_numpy(

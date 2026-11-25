@@ -3058,3 +3058,88 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
     assert seen["names"] == expected
     assert processed == [proposer.draft_model]
     assert "load_weights" not in proposer.draft_model.__dict__
+
+
+def test_mtp_hc_residual_opt_in_does_not_affect_deepseek_v4(monkeypatch):
+    """Only targets with `mtp_emits_aux_hidden_state = True` use aux HC residuals.
+
+    DeepSeek-V4 defines `get_mtp_target_hidden_states` for GPU mutable-buffer
+    handoff while collapsing HC streams in TPU `forward()`, so it must stay on
+    the plain `chunk.hidden_states` path.
+    """
+    from vllm.model_executor.model_loader import utils as loader_utils
+
+    from vllm_torchtpu.models.vllm.deepseek_v4.model import DeepseekV4ForCausalLM
+
+    class _OptInHcTarget:
+        mtp_emits_aux_hidden_state = True
+
+    def _build_proposer(target_cls, *, hc_mult: int = 4, with_arch: bool = True):
+        calls = []
+
+        def fake_get_model_cls(_mc):
+            calls.append(1)
+            return target_cls
+
+        monkeypatch.setattr(loader_utils, "get_model_cls", fake_get_model_cls)
+        proposer = _make_proposer(draft_tp=1, target_tp=1, method="mtp")
+        draft_cfg = SimpleNamespace(
+            hf_config=SimpleNamespace(hc_mult=hc_mult),
+            hf_text_config=SimpleNamespace(hidden_size=256, hc_count=hc_mult),
+        )
+        proposer.speculative_config.draft_model_config = draft_cfg
+        proposer.speculative_config.num_speculative_tokens = 1
+        proposer.vllm_config.model_config = (
+            SimpleNamespace(architecture="TargetArch")
+            if with_arch
+            else SimpleNamespace()
+        )
+        proposer.draft_model = SimpleNamespace(config=SimpleNamespace(hidden_size=256))
+        return proposer, calls
+
+    # DeepSeek-V4 has get_mtp_target_hidden_states, but must NOT trigger aux HC.
+    assert hasattr(DeepseekV4ForCausalLM, "get_mtp_target_hidden_states")
+    dsv4_proposer, dsv4_calls = _build_proposer(DeepseekV4ForCausalLM, hc_mult=4)
+    assert dsv4_proposer._uses_target_hc_residual() is False
+    assert dsv4_proposer._uses_target_hc_residual() is False
+    assert len(dsv4_calls) == 1
+    assert dsv4_proposer._draft_input_hidden_size() == 256
+
+    # Missing architecture attribute on mock model_config degrades cleanly.
+    no_arch_proposer, _ = _build_proposer(_OptInHcTarget, with_arch=False)
+    assert no_arch_proposer._uses_target_hc_residual() is False
+
+    # Opt-in targets widen draft input to hc_mult * hidden_size.
+    hc_proposer, hc_calls = _build_proposer(_OptInHcTarget, hc_mult=4)
+    assert hc_proposer._uses_target_hc_residual() is True
+    assert hc_proposer._uses_target_hc_residual() is True
+    assert len(hc_calls) == 1
+    assert hc_proposer._draft_hidden_size() == 256
+    assert hc_proposer._draft_input_hidden_size() == 1024
+
+    # propose() validates both aux tensor count and trailing hidden width.
+    for aux, pattern in (
+        ([], "exactly 1 aux hidden state tensor, got 0"),
+        (
+            [torch.zeros(2, 256)],
+            "width 256 does not match expected draft input width 1024",
+        ),
+    ):
+        chunk = DraftChunkInputs(
+            input_ids=torch.zeros(2, dtype=torch.int32),
+            position_ids=torch.zeros(2, dtype=torch.int32),
+            query_start_loc_np=np.array([0, 2], dtype=np.int32),
+            attn_ctx=mock.MagicMock(),
+            start_index=0,
+            num_reqs=1,
+            hidden_states=torch.zeros(2, 256),
+            aux_hidden_states=aux,
+        )
+        hc_proposer.draft_chunks = [chunk]
+        with pytest.raises(RuntimeError, match=pattern):
+            hc_proposer.propose(
+                sampled_token_ids=torch.zeros((1, 1), dtype=torch.int32),
+                discard_sampled_tokens_req_indices=np.array([], dtype=np.int32),
+                num_rejected_tokens_np=np.array([0], dtype=np.int32),
+                scheduler_output=mock.MagicMock(),
+            )
