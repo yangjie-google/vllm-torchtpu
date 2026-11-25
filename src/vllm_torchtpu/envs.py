@@ -1349,6 +1349,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY": env_str(
         "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY", default=""
     ),
+    # Standard HuggingFace Hub cache, offline mode, and authentication variables.
+    "HF_HUB_CACHE": env_str("HF_HUB_CACHE", default=""),
+    "HF_HOME": env_str("HF_HOME", default=""),
+    "HF_HUB_OFFLINE": env_bool("HF_HUB_OFFLINE", default=False),
+    "TRANSFORMERS_OFFLINE": env_bool("TRANSFORMERS_OFFLINE", default=False),
+    "HF_TOKEN": env_str("HF_TOKEN", default=""),
+    "HUGGING_FACE_HUB_TOKEN": env_str("HUGGING_FACE_HUB_TOKEN", default=""),
 }
 
 
