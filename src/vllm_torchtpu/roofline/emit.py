@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import asdict
 from typing import TYPE_CHECKING, TypedDict, Unpack
@@ -28,6 +29,7 @@ from .chips import (
     topologies_for_chip,
 )
 from .constants import (
+    BITS_PER_BYTE,
     DEFAULT_CHIPS_PER_HOST,
     DEFAULT_CORES_PER_CHIP,
     DEFAULT_HBM_RESERVE_GB,
@@ -157,6 +159,7 @@ def _build_provenance_payload(
     plan: ServingPlan,
     *,
     dtypes: Dtypes | None = None,
+    chip: ChipSpec | None = None,
 ) -> ProvenancePayload:
     """Build provenance block recording active calibrations and supplied overrides."""
     active_calibrations: list[str] = []
@@ -195,6 +198,30 @@ def _build_provenance_payload(
         )
         if is_cal:
             active_calibrations.append("moe_activation")
+    if plan.scenario.kv_offload_gb > 0.0:
+        supplied_values.append(
+            _supplied_entry(
+                "kv_offload_gb",
+                "--kv-offload-gb",
+                "constraint",
+                plan.scenario.kv_offload_gb,
+                "GiB",
+            )
+        )
+    if chip is not None:
+        base_chip = CHIPS.get(plan.chip)
+        if base_chip is not None and not math.isclose(
+            chip.dcn_bw, base_chip.dcn_bw, rel_tol=1e-9, abs_tol=1e-12
+        ):
+            supplied_values.append(
+                _supplied_entry(
+                    "dcn_gbit_per_s",
+                    "--dcn-gbit-per-s",
+                    "constraint",
+                    (chip.dcn_bw * BITS_PER_BYTE) / UNIT_GIGA,
+                    "Gbit/s",
+                )
+            )
     if dtypes is not None:
         if dtypes.w_dense_source == "flag":
             supplied_values.append(
@@ -600,7 +627,7 @@ def build_solve_payload(
         "top_k_limit": top_k,
         "search": asdict(plan.search) if plan.search is not None else None,
         "schema": SOLVE_SCHEMA,
-        "provenance": _build_provenance_payload(plan, dtypes=dtypes),
+        "provenance": _build_provenance_payload(plan, dtypes=dtypes, chip=chip),
         "chip_spec": chip_dict,
         "model": model,
         "top_k": top_entries,
