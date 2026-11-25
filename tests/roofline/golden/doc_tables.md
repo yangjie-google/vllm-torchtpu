@@ -16,14 +16,14 @@ Generated from `tests/roofline/fixtures/manifest.json` and `tests/roofline/golde
 | Model | Slice | Legal Candidates | Top Layout | TPOT Floor (ms) | Est. Tput (tok/s/chip) | Ceiling (tok/s/chip) |
 | :--- | :--- | ---: | :--- | ---: | ---: | ---: |
 | `glm_5_2_fp8` | `2x2x1` | 102 | `TP8 x EP4 x DCP8` | 1.76 | 2,695.2 | 24,565.8 |
-| `glm_5_2_fp8` | `2x2x2` | 429 | `TP2 x DP8 x EP16 x DCP2` | 3.53 | 4,016.9 | 19,445.4 |
-| `glm_5_2_fp8` | `2x2x4` | 1134 | `TP2 x DP8 x EP16 x DCP2` | 3.53 | 4,016.9 | 19,445.4 |
+| `glm_5_2_fp8` | `2x2x2` | 497 | `TP2 x DP8 x EP16 x DCP2` | 3.53 | 4,016.9 | 19,445.4 |
+| `glm_5_2_fp8` | `2x2x4` | 1556 | `TP2 x DP8 x EP16 x DCP2` | 3.53 | 4,016.9 | 19,445.4 |
 | `glm_5_2_nvfp4` | `2x2x1` | 120 | `TP2 x DP4 x EP8 x DCP2` | 5.59 | 5,012.3 | 24,794.0 |
-| `glm_5_2_nvfp4` | `2x2x2` | 465 | `TP2 x DP4 x EP8 x DCP2` | 5.59 | 5,012.3 | 24,794.0 |
-| `glm_5_2_nvfp4` | `2x2x4` | 1188 | `TP2 x DP4 x EP8 x DCP2` | 5.59 | 5,012.3 | 24,794.0 |
+| `glm_5_2_nvfp4` | `2x2x2` | 545 | `TP2 x DP4 x EP8 x DCP2` | 5.59 | 5,012.3 | 24,794.0 |
+| `glm_5_2_nvfp4` | `2x2x4` | 1658 | `TP2 x DP4 x EP8 x DCP2` | 5.59 | 5,012.3 | 24,794.0 |
 | `qwen3_5_397b_fp8` | `2x2x1` | 102 | `TP2 x DP4 x EP8` | 1.88 | 9,966.3 | 74,396.7 |
-| `qwen3_5_397b_fp8` | `2x2x2` | 369 | `TP2 x DP4 x EP8` | 1.88 | 9,966.3 | 74,396.7 |
-| `qwen3_5_397b_fp8` | `2x2x4` | 924 | `TP2 x DP4 x EP8` | 1.88 | 9,966.3 | 74,396.7 |
+| `qwen3_5_397b_fp8` | `2x2x2` | 437 | `TP2 x DP4 x EP8` | 1.88 | 9,966.3 | 74,396.7 |
+| `qwen3_5_397b_fp8` | `2x2x4` | 1306 | `TP2 x DP4 x EP8` | 1.88 | 9,966.3 | 74,396.7 |
 | `qwen3_5_397b_nvfp4` | `2x2x1` | 120 | `TP2 x DP4 x EP8` | 2.71 | 10,901.3 | 51,625.6 |
-| `qwen3_5_397b_nvfp4` | `2x2x2` | 405 | `TP2 x DP4 x EP8` | 2.71 | 10,901.3 | 51,625.6 |
-| `qwen3_5_397b_nvfp4` | `2x2x4` | 978 | `TP2 x DP4 x EP8` | 2.71 | 10,901.3 | 51,625.6 |
+| `qwen3_5_397b_nvfp4` | `2x2x2` | 485 | `TP2 x DP4 x EP8` | 2.71 | 10,901.3 | 51,625.6 |
+| `qwen3_5_397b_nvfp4` | `2x2x4` | 1408 | `TP2 x DP4 x EP8` | 2.71 | 10,901.3 | 51,625.6 |

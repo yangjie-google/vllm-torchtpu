@@ -292,6 +292,9 @@ class ServingPlan:
         default_factory=ExpertActivationModel
     )
     ruled_out_candidates: tuple[ParetoPoint, ...] = ()
+    sweep_candidates: tuple[ParetoPoint, ...] = ()
+    winner_prefix_hit_range: tuple[float, float] | None = None
+    prefix_hit_crossover_rate: float | None = None
 
 
 class ProvenancePayload(TypedDict):
@@ -338,7 +341,16 @@ class ReferenceLayoutReport(TypedDict):
     rank_by_estimated_throughput: int | None
     in_top_k: bool
     point: Mapping[str, object] | None
+    family_in_ordered_top_k: bool
+    ordered_family_peer: str | None
     rejected_by: str
+    rejection_reason: str
+    slo_verdict: SloVerdict | None
+    bound_tpot_ms: float | None
+    bound_ttft_ms: float | None
+    floor_throughput_per_chip: float | None
+    hbm_used_gb: float | None
+    min_decode_seqs: float | None
 
 
 class SolvePayload(TypedDict):

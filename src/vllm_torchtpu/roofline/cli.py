@@ -501,7 +501,7 @@ def _write_solve_text_output(
                 )
             else:
                 pools = (
-                    f"1x{point.decode_pool.topology}"
+                    f"{point.decode_pool.instances}x{point.decode_pool.topology}"
                     f"({_format_pool_axes(point.decode_pool)})"
                 )
             mark = "*" if point.is_pareto else ""
@@ -645,12 +645,19 @@ def _build_reference_report_for_cli(
         else solve_opts
     )
     topos = _resolve_solve_topologies(ref_opts, chip=chip)
-    rejected_by = explain_layout_rejection(geometry, parsed_ref, topos, solve_opts)
+    rejected_by = explain_layout_rejection(
+        geometry,
+        parsed_ref,
+        topos,
+        solve_opts,
+        concurrencies=serving_plan.scenario.concurrencies,
+    )
     return reference_layout_report(
         serving_plan,
         top_layouts(serving_plan, args.top_k),
         ref_layout,
         rejected_by,
+        top_k=args.top_k,
     )
 
 
