@@ -200,6 +200,7 @@ def test_report_slo_unmet_recommended_renders_warning_banner(
     assert sample_payload["recommended"] is not None
     rec_unmet = dict(sample_payload["recommended"])
     rec_unmet["slo_met"] = False
+    rec_unmet["slo_verdict"] = "ruled_out"
     payload["recommended"] = rec_unmet
     payload["top_k"] = []
     payload["warnings"] = []

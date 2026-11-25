@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict
 
 from .chips import count_hosts
@@ -30,6 +30,7 @@ from .constants import (
     TOPOLOGY_AXES,
     SloVerdict,
 )
+from .occupancy import ExpertActivationModel
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -176,6 +177,8 @@ class SearchStats:
     slo_met: int
     frontier: int
     core_grid: int = 0
+    not_ruled_out: int = 0
+    envelope_feasible: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,10 +244,17 @@ class ParetoPoint:
     p_mixed: float
     binding: str
     slo_met: bool
-    slo_verdict: SloVerdict | None = None
+    bound_tpot_ms: float = 0.0
+    bound_ttft_ms: float = 0.0
+    slo_verdict: SloVerdict = SLO_VERDICT_ESTIMATE_MEETS
     decode_floor: FloorTimes | None = None
     kv_cache_capacity_tokens: int | None = None
     effective_prefix_hit_rate: float | None = None
+    min_decode_seqs: float = 0.0
+    floor_throughput_per_chip: float = 0.0
+    envelope_tpot_ms: float = 0.0
+    envelope_ttft_ms: float = 0.0
+    envelope_decode_seqs: float = 0.0
     is_pareto: bool = False
 
 
@@ -265,6 +275,8 @@ class ServingPlan:
     hbm_reserve_gb: float = DEFAULT_HBM_RESERVE_GB
     collective_latency_s: float = 0.0
     spec_k: int = 0
+    spec_tokens: int = 0
+    mtp_layers: int = 0
     sort_by: SortBy = "throughput"
     model_id: str = ""
     search: SearchStats | None = None
@@ -273,6 +285,10 @@ class ServingPlan:
     budget_source: str = "flag"
     max_instances: int | None = None
     pins: dict[str, object] | None = None
+    activation_model: ExpertActivationModel = field(
+        default_factory=ExpertActivationModel
+    )
+    ruled_out_candidates: tuple[ParetoPoint, ...] = ()
 
 
 class ProvenancePayload(TypedDict):
@@ -372,10 +388,13 @@ class CeilingRow(TypedDict):
     output_throughput_per_chip: float
     est_ttft_ms: float
     est_tpot_ms: float
+    bound_tpot_ms: float
     concurrency: int
     total_chips: int
     mode: str
     binding_unit: str
+    min_decode_seqs: float
+    floor_throughput_per_chip: float
     slo_met: bool
     is_pareto: bool
     decode_topology: str

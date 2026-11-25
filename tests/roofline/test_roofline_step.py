@@ -1511,3 +1511,72 @@ def test_locked_fixtures_across_all_topologies_respect_floor_ordering(
     assert len(rows) == 1
     assert rows[0].hard_floor_ms > 0.0
     assert rows[0].output_tput_ceil_per_chip > 0.0
+
+
+def test_unpadded_prefill_capacity_bound_keeps_sampled_lm_head_rows() -> None:
+    """Unpadded prefill capacity bound charges 1 sampled LM-head row, not isl rows."""
+    bundle = load_locked_bundle("qwen3_5_397b_fp8.json")
+    geometry, dtypes = bundle.geometry, bundle.dtypes
+    chip = CHIPS["tpu7x"]
+    topology = TOPOLOGIES["2x2x1"]
+    parallel = Parallel(
+        tp=8,
+        dp=1,
+        ep=8,
+        moe="ep",
+        moe_dispatch="ag_ep",
+        ranks_per_chip=topology.cores_per_chip,
+    )
+    short_shape = StepShape(
+        batch=0, rows_per_seq=1, context=0, prefill_tokens=1024, prefix_hit_rate=0.0
+    )
+    long_shape = StepShape(
+        batch=0, rows_per_seq=1, context=0, prefill_tokens=8192, prefix_hit_rate=0.0
+    )
+    short_lm = next(
+        m
+        for m in pass_costs(
+            geometry, parallel, short_shape, dtypes, unpadded_linear=True, chip=chip
+        )
+        if m.name == "lm_head"
+    )
+    long_lm = next(
+        m
+        for m in pass_costs(
+            geometry, parallel, long_shape, dtypes, unpadded_linear=True, chip=chip
+        )
+        if m.name == "lm_head"
+    )
+    assert short_lm.bf16_flops == pytest.approx(long_lm.bf16_flops, rel=0, abs=0)
+    assert short_lm.ici_bytes == pytest.approx(long_lm.ici_bytes, rel=0, abs=0)
+    zero_lm = next(
+        m
+        for m in pass_costs(
+            geometry,
+            parallel,
+            StepShape(batch=0, rows_per_seq=0, context=0, prefill_tokens=0),
+            dtypes,
+            unpadded_linear=True,
+            chip=chip,
+        )
+        if m.name == "lm_head"
+    )
+    assert zero_lm.bf16_flops == 0.0
+    assert zero_lm.vector_flops == 0.0
+    assert zero_lm.ici_bytes == 0.0
+    unp_short = rf.unpadded_strict_resource_times(
+        geometry,
+        chip,
+        parallel,
+        short_shape,
+        rf.UnpaddedFloorOptions(dtypes=dtypes, topology=topology, zero_weights=True),
+    )
+    unp_long = rf.unpadded_strict_resource_times(
+        geometry,
+        chip,
+        parallel,
+        long_shape,
+        rf.UnpaddedFloorOptions(dtypes=dtypes, topology=topology, zero_weights=True),
+    )
+    assert all(val >= 0.0 for val in unp_short)
+    assert unp_long[1] > unp_short[1]

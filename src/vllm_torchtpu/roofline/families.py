@@ -19,7 +19,7 @@ import re
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Final, cast
 
-from .constants import SLO_VERDICT_RULED_OUT
+from .constants import SLO_VERDICT_RANK, SLO_VERDICT_RULED_OUT
 from .schema import (
     BoundFamilyEntry,
     ParetoPoint,
@@ -69,15 +69,32 @@ def strict_rank(
     return 1 + sum(1 for other in values if other > value)
 
 
-def _point_tpot_floor_ms(point: ParetoPoint, *, accept_len: float = 1.0) -> float:
-    """Return per-token decode TPOT lower bound (ms) available on a candidate point."""
+def _point_tpot_floor_ms(
+    point: ParetoPoint,
+    *,
+    accept_len: float = 1.0,
+    use_envelope: bool = False,
+) -> float:
+    """Return active decode TPOT lower bound (ms) for a candidate point."""
+    if use_envelope and point.envelope_tpot_ms > 0.0:
+        return point.envelope_tpot_ms
+    if point.bound_tpot_ms > 0.0:
+        return point.bound_tpot_ms
     if point.decode_floor is not None:
         return point.decode_floor.hard_floor_ms / max(1.0, accept_len)
     return point.est_tpot_ms
 
 
-def _point_ttft_floor_ms(point: ParetoPoint) -> float:
-    """Return prefill TTFT reference time (ms) available on a candidate point."""
+def _point_ttft_floor_ms(
+    point: ParetoPoint,
+    *,
+    use_envelope: bool = False,
+) -> float:
+    """Return active prefill TTFT lower bound (ms) for a candidate point."""
+    if use_envelope and point.envelope_ttft_ms > 0.0:
+        return point.envelope_ttft_ms
+    if point.bound_ttft_ms > 0.0:
+        return point.bound_ttft_ms
     return point.est_ttft_ms
 
 
@@ -112,9 +129,10 @@ def _ordered_candidate_key(
     sort_by: SortBy,
     *,
     accept_len: float = 1.0,
-) -> tuple[bool, bool, float, float, float, str]:
-    """Order candidates within one concurrency by SLO status and requested metric."""
-    not_ruled_out = effective_slo_verdict(point) != SLO_VERDICT_RULED_OUT
+    use_envelope: bool = False,
+) -> tuple[int, float, float, float, float, int, str]:
+    """Order candidates by 3-valued verdict, metric, ceiling, floor, and chips."""
+    verdict_rank = -SLO_VERDICT_RANK[effective_slo_verdict(point)]
     primary = (
         -point.est_interactivity_tok_s
         if sort_by == "interactivity"
@@ -126,11 +144,12 @@ def _ordered_candidate_key(
         else -point.est_interactivity_tok_s
     )
     return (
-        not point.slo_met,
-        not not_ruled_out,
+        verdict_rank,
         primary,
+        -point.floor_throughput_per_chip,
+        _point_tpot_floor_ms(point, accept_len=accept_len, use_envelope=use_envelope),
         secondary,
-        _point_tpot_floor_ms(point, accept_len=accept_len),
+        point.total_chips,
         str(_point_struct_key(point)),
     )
 
@@ -141,11 +160,14 @@ def _ordered_concurrency_candidates(
     sort_by: SortBy,
     limit: int | None,
     accept_len: float = 1.0,
+    use_envelope: bool = False,
 ) -> tuple[ParetoPoint, ...]:
     """Order all legal candidates at one concurrency and optionally cut to limit."""
     ordered = sorted(
         points,
-        key=lambda point: _ordered_candidate_key(point, sort_by, accept_len=accept_len),
+        key=lambda point: _ordered_candidate_key(
+            point, sort_by, accept_len=accept_len, use_envelope=use_envelope
+        ),
     )
     if limit is not None:
         return tuple(ordered[:limit])
@@ -160,6 +182,7 @@ def ordered_candidates_by_concurrency(
     if (top_k is not None and top_k <= 0) or not plan.candidates:
         return {}
     accept_len = max(1.0, plan.scenario.accept_len)
+    use_envelope = plan.activation_model.prunes_on_envelope
     by_concurrency: dict[int, list[ParetoPoint]] = {}
     for point in plan.candidates:
         by_concurrency.setdefault(point.concurrency, []).append(point)
@@ -169,6 +192,7 @@ def ordered_candidates_by_concurrency(
             sort_by=plan.sort_by,
             limit=top_k,
             accept_len=accept_len,
+            use_envelope=use_envelope,
         )
         for concurrency in sorted(by_concurrency)
     }
@@ -197,7 +221,7 @@ def _bound_family_label(point: ParetoPoint) -> tuple[str, ...]:
 class _BoundFamilySummary:
     """Intermediate sortable family summary for one concurrency level."""
 
-    sort_key: tuple[bool, float, float]
+    sort_key: tuple[bool, float, float, float]
     payload: BoundFamilyEntry
 
 
@@ -206,12 +230,12 @@ def _summarize_bound_family(
     group: Sequence[ParetoPoint],
     *,
     accept_len: float = 1.0,
+    use_envelope: bool = False,
 ) -> _BoundFamilySummary:
     """Aggregate one structural family into per-metric bound envelopes.
 
     ``min_bound_tpot_ms`` and ``min_bound_ttft_ms`` are independent per-metric
-    minima over active family members (the modeled TTFT estimate serves as the
-    standalone TTFT reference when dedicated prefill bounds are absent).
+    minima over active family members.
     """
     active = [
         point
@@ -223,6 +247,9 @@ def _summarize_bound_family(
     best_point = min(
         pool,
         key=lambda point: (
+            _point_tpot_floor_ms(
+                point, accept_len=accept_len, use_envelope=use_envelope
+            ),
             _point_tpot_floor_ms(point, accept_len=accept_len),
             _point_ttft_floor_ms(point),
             -point.token_throughput_per_chip,
@@ -231,6 +258,9 @@ def _summarize_bound_family(
     sorted_members = sorted(
         pool,
         key=lambda point: (
+            _point_tpot_floor_ms(
+                point, accept_len=accept_len, use_envelope=use_envelope
+            ),
             _point_tpot_floor_ms(point, accept_len=accept_len),
             -point.token_throughput_per_chip,
         ),
@@ -239,19 +269,27 @@ def _summarize_bound_family(
         _point_tpot_floor_ms(point, accept_len=accept_len) for point in pool
     )
     min_bound_ttft = min(_point_ttft_floor_ms(point) for point in pool)
+    min_env_tpot = min(
+        _point_tpot_floor_ms(point, accept_len=accept_len, use_envelope=True)
+        for point in pool
+    )
+    min_env_ttft = min(_point_ttft_floor_ms(point, use_envelope=True) for point in pool)
+    active_tpot = min_env_tpot if use_envelope else min_bound_tpot
     members: list[dict[str, object]] = [dict(asdict(point)) for point in sorted_members]
     payload: BoundFamilyEntry = {
         "rank": 0,
         "family": family_label,
         "min_bound_tpot_ms": min_bound_tpot,
         "min_bound_ttft_ms": min_bound_ttft,
+        "min_envelope_tpot_ms": min_env_tpot,
+        "min_envelope_ttft_ms": min_env_ttft,
         "binding": best_point.binding,
         "any_not_ruled_out": any_not_ruled_out,
         "member_count": len(members),
         "members": members,
     }
     return _BoundFamilySummary(
-        sort_key=(not any_not_ruled_out, min_bound_tpot, min_bound_ttft),
+        sort_key=(not any_not_ruled_out, active_tpot, min_bound_tpot, min_bound_ttft),
         payload=payload,
     )
 
@@ -327,6 +365,7 @@ def _summarize_pool_record_family(
         sort_key=(
             not any_slo_met,
             primary_bound,
+            primary_bound,
             -best_record.token_throughput_per_chip,
         ),
         payload=payload,
@@ -396,8 +435,11 @@ def build_bound_families_by_concurrency(
             key = _bound_family_key(point)
             grouped.setdefault(key, []).append(point)
             labels.setdefault(key, _bound_family_label(point))
+        use_env = plan.activation_model.prunes_on_envelope
         summaries = [
-            _summarize_bound_family(labels[key], group, accept_len=accept_len)
+            _summarize_bound_family(
+                labels[key], group, accept_len=accept_len, use_envelope=use_env
+            )
             for key, group in grouped.items()
         ]
         summaries.sort(key=lambda item: item.sort_key)
@@ -597,9 +639,15 @@ def reference_layout_report(
         normalized_layout = format_parallelism(parsed_layout["decode"])
 
     accept_len = max(1.0, plan.scenario.accept_len)
+    use_envelope = plan.activation_model.prunes_on_envelope
+    all_searched = (
+        (*plan.candidates, *plan.ruled_out_candidates)
+        if plan.ruled_out_candidates
+        else plan.candidates
+    )
     matching_candidates = [
         candidate
-        for candidate in plan.candidates
+        for candidate in all_searched
         if _candidate_matches_layout(candidate, parsed_layout)
     ]
     found = len(matching_candidates) > 0
@@ -616,7 +664,9 @@ def reference_layout_report(
                     else candidate.token_throughput_per_chip
                 ),
                 candidate.token_throughput_per_chip,
-                -_point_tpot_floor_ms(candidate, accept_len=accept_len),
+                -_point_tpot_floor_ms(
+                    candidate, accept_len=accept_len, use_envelope=use_envelope
+                ),
             ),
         )
         ruled_out = effective_slo_verdict(best_candidate) == SLO_VERDICT_RULED_OUT
@@ -630,14 +680,25 @@ def reference_layout_report(
             for candidate in peer_candidates
             if _candidate_matches_layout(candidate, parsed_layout)
         ]
+        if not matching_same_concurrency:
+            matching_same_concurrency = [
+                candidate
+                for candidate in all_searched
+                if candidate.concurrency == best_candidate.concurrency
+                and _candidate_matches_layout(candidate, parsed_layout)
+            ]
         reference_bound = min(
-            _point_tpot_floor_ms(candidate, accept_len=accept_len)
+            _point_tpot_floor_ms(
+                candidate, accept_len=accept_len, use_envelope=use_envelope
+            )
             for candidate in matching_same_concurrency
         )
         other_bounds = _best_values_by_non_matching_layout(
             peer_candidates,
             parsed_layout,
-            lambda candidate: _point_tpot_floor_ms(candidate, accept_len=accept_len),
+            lambda candidate: _point_tpot_floor_ms(
+                candidate, accept_len=accept_len, use_envelope=use_envelope
+            ),
             lower_is_better=True,
         )
         num_candidates = 1 + len(other_bounds)

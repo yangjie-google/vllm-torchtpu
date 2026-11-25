@@ -341,7 +341,7 @@ def _route_matmul_flops(
 
 
 def _subchannel_scale_vector_flops(
-    rows: int,
+    rows: float,
     weight_elems: float,
     weight_bytes: float,
     weight_block_size: tuple[int, int] = (1, 1),
@@ -455,6 +455,7 @@ class _StepContext:
     activation_model: ExpertActivationModel = field(
         default_factory=ExpertActivationModel
     )
+    unpadded_linear: bool = False
     chip: ChipSpec = field(default_factory=lambda: CHIPS["tpu7x"])
 
 
@@ -2206,7 +2207,7 @@ class _RoutedMoeLayout:
     routed_act_elems: float
     routed_act_elems_min: float
     routed_rows: int
-    sh_rows: int
+    sh_rows: int | float
 
 
 def _routed_moe_layout(
@@ -2314,10 +2315,14 @@ def _routed_moe_layout(
         * (geometry.moe_inter / eff_moe_div)
     )
     routed_rows = global_rows if is_ep else eval_context.rows
-    sh_rows = (
-        math.ceil(eval_context.rows / tp)
-        if parallel.residual == "sp"
-        else eval_context.rows
+    sh_rows: int | float = (
+        float(eval_context.rows) / float(tp)
+        if (eval_context.unpadded_linear and parallel.residual == "sp")
+        else (
+            math.ceil(eval_context.rows / tp)
+            if parallel.residual == "sp"
+            else eval_context.rows
+        )
     )
     return _RoutedMoeLayout(
         tp=tp,
@@ -2887,7 +2892,7 @@ def _compute_lm_head_cost(
     sampled_rows = (
         eval_context.decode_rows
         if eval_context.decode_rows > 0
-        else max(1, eval_context.batch)
+        else (0 if eval_context.rows == 0 else max(1, eval_context.batch))
     )
     # Last pipeline stage holds lm_head whole (sharded only across TP).
     lm_elems = float(geometry.vocab * geometry.hidden // tp)
@@ -2934,6 +2939,7 @@ class PassCostOptions(TypedDict, total=False):
     mxu_lhs_rows_fp8: int | None
     fp8_to_bf16_ratio: float | None
     activation_model: ExpertActivationModel
+    unpadded_linear: bool
     chip: ChipSpec | None
 
 
@@ -2962,6 +2968,7 @@ def pass_costs(
     )
     fp8_to_bf16_ratio = default_fp8_ratio if raw_fp8_ratio is None else raw_fp8_ratio
     activation_model = options.get("activation_model", _DEFAULT_ACTIVATION_MODEL)
+    unpadded_linear = options.get("unpadded_linear", False)
     eff_ranks = (
         parallel.ranks_per_chip
         if parallel.ranks_per_chip is not None
@@ -2981,14 +2988,16 @@ def pass_costs(
         else 1.0
     )
     decode_rows = shape.batch * shape.rows_per_seq
+    raw_uncached = (
+        shape.prefill_tokens
+        * max(0.0, 1.0 - shape.prefix_hit_rate)
+        / max(1, eff_parallel.pcp)
+    )
     eff_prefill = (
-        max(
-            1,
-            math.ceil(
-                shape.prefill_tokens
-                * max(0.0, 1.0 - shape.prefix_hit_rate)
-                / max(1, eff_parallel.pcp)
-            ),
+        (
+            math.floor(raw_uncached)
+            if unpadded_linear
+            else max(1, math.ceil(raw_uncached))
         )
         if shape.prefill_tokens > 0
         else 0
@@ -3016,6 +3025,7 @@ def pass_costs(
         mxu_lhs_rows_fp8=mxu_lhs_rows_fp8,
         fp8_to_bf16_ratio=fp8_to_bf16_ratio,
         activation_model=activation_model,
+        unpadded_linear=unpadded_linear,
         chip=eff_chip,
     )
 

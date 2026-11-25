@@ -50,6 +50,7 @@ from .constants import (
     MXU_M_TILE_BRACKET,
     PCIE_BRACKET_BW,
     PERCENT_SCALE,
+    SOLVER_ASSUMPTIONS,
     SUBCHANNEL_BLOCK_K_FLOOR,
     TOPOLOGY_AXES,
     TPU7X_FP8_FLOPS_PER_CORE_BRACKET,
@@ -1505,3 +1506,11 @@ def load_chip_spec(
         raw, chip.cores_per_chip, base_name, chip.min_torus_dim
     )
     return chip, topologies
+
+
+def get_solver_assumptions(
+    chip: ChipSpec | None = None,
+) -> list[dict[str, object]]:
+    """Return a fresh list of structured physics solver assumption entries."""
+    _ = chip
+    return [dict(entry) for entry in SOLVER_ASSUMPTIONS]

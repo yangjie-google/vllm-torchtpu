@@ -565,7 +565,7 @@ def _render_limits_svg(floor: Mapping[str, object] | None) -> str:
             bar_w = 0.0
             width_attr = "0"
         else:
-            bar_w = max(2.5, (val / max_val) * plot_w)
+            bar_w = 0.0 if val < 5e-4 else max(2.5, (val / max_val) * plot_w)
             width_attr = f"{bar_w:.1f}"
         weight = "700" if label == "Hard Floor" else "500"
         svg_parts.extend(
@@ -945,11 +945,13 @@ def _extract_recommended_view(
     accept_len: float = 1.0,
 ) -> tuple[dict[str, object], list[Mapping[str, object]], str]:
     """Extract display metrics, instance pools, and summary for recommended."""
-    if (
-        recommended is not None
-        and recommended.get("slo_verdict") != SLO_VERDICT_RULED_OUT
-        and bool(recommended.get("slo_met", True))
-    ):
+    rec_verdict = recommended.get("slo_verdict") if recommended is not None else None
+    rec_feasible = recommended is not None and (
+        rec_verdict != SLO_VERDICT_RULED_OUT
+        if rec_verdict is not None
+        else bool(recommended.get("slo_met", True))
+    )
+    if recommended is not None and rec_feasible:
         pools_list: list[Mapping[str, object]] = []
         prefill_pool = _as_mapping(recommended.get("prefill_pool"))
         decode_pool = _as_mapping(recommended.get("decode_pool"))
@@ -2080,9 +2082,11 @@ def render_html(payload: Mapping[str, object]) -> str:
         if is_hbm_oom
         else "No candidate layout met latency SLOs; recommended layout is infeasible."
     )
+    top_verdict = recommended.get("slo_verdict") if recommended is not None else None
     rec_infeasible = recommended is None or (
-        recommended.get("slo_verdict") == SLO_VERDICT_RULED_OUT
-        or not bool(recommended.get("slo_met", True))
+        top_verdict == SLO_VERDICT_RULED_OUT
+        if top_verdict is not None
+        else not bool(recommended.get("slo_met", True))
     )
     if rec_infeasible and infeasible_msg not in warnings:
         warnings.append(infeasible_msg)
