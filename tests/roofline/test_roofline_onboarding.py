@@ -669,3 +669,75 @@ def test_cli_inspect_text_output_and_fail_closed_tier2_blocker(
     out_blocked = capsys.readouterr().out
     assert "onboarding_tier: tier2_primitive_needed" in out_blocked
     assert "model_type_status: unlisted_blocked" in out_blocked
+
+
+def test_onboarding_doc_provenance_flags_populate_supplied_values(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify every flag documented in roofline_onboarding populates supplied_values."""
+    q35_path = Path(__file__).resolve().parent / "fixtures" / "qwen3_5_397b_fp8.json"
+    rc = cli.main(
+        [
+            "solve",
+            "--config",
+            str(q35_path),
+            "--mode",
+            "mixed",
+            "--max-chips",
+            "4",
+            "--isl",
+            "4096",
+            "--osl",
+            "512",
+            "--prefix-hit-rate",
+            "0.5",
+            "--accept-len",
+            "1.0",
+            "--think-time-s",
+            "0.0",
+            "--concurrency",
+            "16",
+            "--hbm-reserve-gb",
+            "8",
+            "--collective-latency-us",
+            "5",
+            "--moe-activation",
+            "pigeonhole",
+            "--kv-offload-gb",
+            "64",
+            "--dcn-gbit-per-s",
+            "200",
+            "--weight-dtype",
+            "bf16",
+            "--expert-weight-dtype",
+            "fp8",
+            "--kv-dtype",
+            "fp8",
+            "--json",
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    supplied_flags = {
+        entry["flag"] for entry in payload["provenance"]["supplied_values"]
+    }
+    expected_flags = {
+        "--hbm-reserve-gb",
+        "--collective-latency-us",
+        "--moe-activation",
+        "--kv-offload-gb",
+        "--dcn-gbit-per-s",
+        "--weight-dtype",
+        "--expert-weight-dtype",
+        "--kv-dtype",
+    }
+    assert expected_flags.issubset(supplied_flags)
+    doc_path = (
+        Path(__file__).resolve().parents[2]
+        / "docs"
+        / "user_guide"
+        / "roofline_onboarding.md"
+    )
+    doc_text = doc_path.read_text(encoding="utf-8")
+    for flag in expected_flags:
+        assert flag in doc_text
