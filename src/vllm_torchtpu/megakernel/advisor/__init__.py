@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from . import chips, constants, models, roofline, spec_bridge, specs, vmem
+from . import chips, constants, models, roofline, spec_bridge, specs, verdict, vmem
 from .chips import TPU7X_TOPOLOGIES, ChipSpec, resolve_chip_spec
 from .constants import CORE_LIMITS, CoreLimits
 from .models import (
@@ -30,16 +30,21 @@ from .models import (
 from .roofline import evaluate_scopes, experts_hit_busiest
 from .spec_bridge import MegakernelPlannerUnavailableError, verify_core_limits_sync
 from .specs import (
+    AdvisorReport,
     EfficiencySpec,
     FusionScope,
+    LayerGroupCandidate,
+    LayerGroupSearchReport,
     MoEMode,
     ObjectiveMode,
+    ParallelismComparisonRow,
     Phase,
     RingPlan,
     ScopeEstimate,
     WorkloadSpec,
     load_measurements,
 )
+from .verdict import advise, compare_parallelism_candidates, search_layer_groups
 from .vmem import (
     compute_all_reduce_transfer_cost,
     compute_per_token_vmem_bytes,
@@ -54,21 +59,27 @@ __all__ = [
     "DEPLOYMENT_PRESETS",
     "MODEL_PRESETS",
     "TPU7X_TOPOLOGIES",
+    "AdvisorReport",
     "ChipSpec",
     "CoreLimits",
     "EfficiencySpec",
     "FusionScope",
+    "LayerGroupCandidate",
+    "LayerGroupSearchReport",
     "MegakernelPlannerUnavailableError",
     "MoEMode",
     "ModelProfile",
     "ObjectiveMode",
     "ParallelLayout",
+    "ParallelismComparisonRow",
     "Phase",
     "RingPlan",
     "ScopeEstimate",
     "UnsupportedArchitectureError",
     "WorkloadSpec",
+    "advise",
     "chips",
+    "compare_parallelism_candidates",
     "compute_all_reduce_transfer_cost",
     "compute_per_token_vmem_bytes",
     "constants",
@@ -83,9 +94,11 @@ __all__ = [
     "resolve_chip_spec",
     "resolve_model_profile",
     "roofline",
+    "search_layer_groups",
     "spec_bridge",
     "specs",
     "validate_advise_inputs",
+    "verdict",
     "verify_core_limits_sync",
     "vmem",
 ]
