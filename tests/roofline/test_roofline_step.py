@@ -35,6 +35,7 @@ from vllm_torchtpu.roofline import (
     FloorOptions,
     ModelGeometry,
     Parallel,
+    SeqKvLayout,
     ServingRequest,
     SpecShape,
     StepShape,
@@ -1286,6 +1287,21 @@ def test_block_parallel_and_multilayer_mtp_draft_cost() -> None:
     )
     assert draft_mlp_2.hbm_bytes == pytest.approx(draft_mlp_1.hbm_bytes, rel=1e-09)
     assert draft_fc_2.hbm_bytes == pytest.approx(draft_fc_1.hbm_bytes, rel=1e-09)
+    seq_layout = SeqKvLayout(1, 1024)
+    bd_mtp2 = rf.hbm_breakdown_per_core_bytes(geom_bp, dtypes, parallel, seq_layout)
+    bd_mtp1 = rf.hbm_breakdown_per_core_bytes(
+        replace(geom_bp, mtp_layers=1), dtypes, parallel, seq_layout
+    )
+    bd_mtp0 = rf.hbm_breakdown_per_core_bytes(
+        replace(geom_bp, mtp_layers=0), dtypes, parallel, seq_layout
+    )
+    assert bd_mtp2.weights - bd_mtp0.weights == pytest.approx(
+        2.0 * (bd_mtp1.weights - bd_mtp0.weights), rel=1e-09
+    )
+    bd_moe = rf.hbm_breakdown_per_core_bytes(
+        replace(geom_bp, mtp_inter=0), dtypes, parallel, seq_layout
+    )
+    assert bd_mtp2.weights < bd_moe.weights
 
 
 @pytest.mark.parametrize("fixture_name", ("glm_5_2_fp8.json", "glm_5_2_nvfp4.json"))

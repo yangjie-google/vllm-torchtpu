@@ -48,6 +48,7 @@ from vllm_torchtpu.roofline.geometry import (
     from_hf_config,
     supports,
 )
+from vllm_torchtpu.roofline.partition import count_full_attn_layers
 
 
 def test_topologies_exclude_subhost_shapes() -> None:
@@ -586,3 +587,4 @@ def test_ffn_only_hybrid_override_excluded_from_full_attn_count() -> None:
     assert geometry.ffn_layer_counts() == (1, 1)
     assert geometry.ffn_kinds == ("none", "dense", "none", "none", "none", "moe")
     assert count_layer_types(geometry).gqa == 1
+    assert count_full_attn_layers(geometry) == 1
