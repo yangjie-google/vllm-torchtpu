@@ -15,6 +15,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 from jax.experimental.pallas import tpu as pltpu
 
@@ -27,6 +30,7 @@ from vllm_torchtpu.roofline import (
     Parallel,
     SpecShape,
     StepShape,
+    cli,
     from_hf_config,
     pass_costs,
     spec_cycle_floor,
@@ -705,3 +709,39 @@ def test_unpadded_strict_and_crossover_preserve_five_matmul_buckets() -> None:
     assert moe_even.fp4_flops > 0.0
     assert moe_ep.fp4_flops > moe_even.fp4_flops
     assert moe_ep.fp4_flops_min == pytest.approx(moe_even.strict_fp4_flops)
+
+
+def test_load_chip_spec_1core_2d_torus_and_cli_assumptions(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify 1-core 2D torus spec end-to-end across assumptions, explain, solve."""
+    synth_int8_flops = 1.5e15
+    spec_payload = _make_base_spec_payload()
+    spec_payload["int8_flops"] = synth_int8_flops
+    spec_path = tmp_path / "synth_1core.json"
+    spec_path.write_text(json.dumps(spec_payload), encoding="utf-8")
+    cfg_path = Path(__file__).resolve().parent / "fixtures" / "qwen3_5_397b_fp8.json"
+
+    rc_assump = cli.main(["--chip-spec", str(spec_path), "--assumptions", "--json"])
+    assert rc_assump == 0
+    assump_json = json.loads(capsys.readouterr().out)
+    assert assump_json["chip"] == "synth_1core_2d"
+    assert "catalog" in assump_json
+    assert "solver_assumptions" in assump_json
+
+    rc_explain = cli.main(
+        [
+            "explain",
+            "--chip-spec",
+            str(spec_path),
+            "--config",
+            str(cfg_path),
+            "--tp",
+            "1",
+        ]
+    )
+    assert rc_explain == 0
+    explain_out = capsys.readouterr().out
+    for col in ("int8_gflops", "fp4_gflops", "int4_gflops", "vector_gflops"):
+        assert col in explain_out
