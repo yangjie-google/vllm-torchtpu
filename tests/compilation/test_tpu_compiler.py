@@ -1227,16 +1227,74 @@ class TestTpuCompilerCache:
     def test_the_in_process_result_is_kept_when_the_reload_fails(
         self, tmp_path, monkeypatch
     ):
+        from vllm_torchtpu.compilation import tpu_compiler
         from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
 
         (a,), compile, compiled, replayed = self._peer_compilers(
             tmp_path, monkeypatch, n=1, peer_replay="0"
+        )
+
+        def cannot_rebuild(entry):
+            raise TypeError("unsupported entry")
+
+        monkeypatch.setattr(
+            tpu_compiler, "_rebuild_sharing_executables", cannot_rebuild
         )
         monkeypatch.setattr(TpuCompilerAdaptor, "_replay", lambda *args, **kw: None)
         fn, handle = compile(a)
 
         assert compiled == [0]
         assert fn() == 0
+        assert handle is not None
+
+    def test_a_compiled_bucket_reuses_its_executable_instead_of_reloading(
+        self, tmp_path, monkeypatch
+    ):
+        """The runnable is rebuilt from the in-process entry, so the saved
+        artifact is not read back: torch_tpu's Tier-1 cache keeps the
+        executable the backend returned, and loading the artifact would add a
+        second copy of it."""
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        (a,), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=1, peer_replay="0"
+        )
+        read_back = []
+        real_replay = TpuCompilerAdaptor._replay
+
+        def replay(self, path, *args, **kwargs):
+            read_back.append(path)
+            return real_replay(self, path, *args, **kwargs)
+
+        monkeypatch.setattr(TpuCompilerAdaptor, "_replay", replay)
+        fn, handle = compile(a)
+
+        assert compiled == [0]
+        assert read_back == []
+        assert replayed == ["entry-from-rank-0"]
+        assert fn() == "entry-from-rank-0"
+        assert handle is not None
+
+    def test_a_bucket_that_cannot_be_rebuilt_replays_its_artifact(
+        self, tmp_path, monkeypatch
+    ):
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        (a,), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=1, peer_replay="0"
+        )
+
+        def cannot_rebuild(entry):
+            raise TypeError("unsupported entry")
+
+        monkeypatch.setattr(
+            tpu_compiler, "_rebuild_sharing_executables", cannot_rebuild
+        )
+        fn, handle = compile(a)
+
+        assert compiled == [0]
+        assert replayed == ["entry-from-rank-0"]
+        assert fn() == "entry-from-rank-0"
         assert handle is not None
 
     def test_nothing_is_reloaded_without_a_saved_artifact(self, tmp_path, monkeypatch):
@@ -1518,3 +1576,1296 @@ def test_deserialize_entry_does_not_copy_the_entry():
             raise AssertionError("replay must not deepcopy the entry")
 
     assert _deserialize_entry(Entry())(2, 3, 7) == 12
+
+
+def test_rebuild_sharing_executables_gives_new_leaves_on_the_same_executable(
+    monkeypatch,
+):
+    """Every object of the entry is new except each leaf's loaded executable,
+    which is neither serialized nor loaded again."""
+    from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
+        TorchTpuCompiledExecutable,
+    )
+
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    class Executable:
+        def __reduce__(self):
+            raise AssertionError("the executable must not be serialized")
+
+    executable = Executable()
+    leaf = TorchTpuCompiledExecutable(
+        executable=executable,
+        reconstruct_fx_outputs_fn=None,
+        updates_default_generator_state=True,
+        dynamic_outputs=[False],
+        unique_output_indices=[0],
+    )
+    other = TorchTpuCompiledExecutable(
+        executable=Executable(),
+        reconstruct_fx_outputs_fn=None,
+        updates_default_generator_state=False,
+    )
+    entry = SimpleNamespace(fw=leaf, same_fw=leaf, bw=other, meta={"k": [1, 2]})
+    monkeypatch.setattr(tpu_compiler, "_deserialize_entry", lambda e: e)
+
+    rebuilt = tpu_compiler._rebuild_sharing_executables(entry)
+
+    assert rebuilt is not entry
+    assert rebuilt.meta == entry.meta and rebuilt.meta is not entry.meta
+    assert rebuilt.fw is not leaf and rebuilt.fw is rebuilt.same_fw
+    assert rebuilt.fw._executable is executable
+    assert rebuilt.fw._updates_default_generator_state is True
+    assert rebuilt.fw._dynamic_outputs == [False]
+    assert rebuilt.fw._unique_output_indices == [0]
+    assert rebuilt.bw is not other and rebuilt.bw._executable is other._executable
+    assert rebuilt.bw._updates_default_generator_state is False
+
+
+def _rebuild_subclass_marker(tag: str) -> tuple[str, str]:
+    return ("subclass-reduced", tag)
+
+
+def test_rebuild_sharing_executables_keeps_subclass_reduce(monkeypatch):
+    """Subclasses of `TorchTpuCompiledExecutable` bypass `persistent_id` and
+    keep their own `__reduce__`, while exact instances still share their
+    loaded executable."""
+    from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
+        TorchTpuCompiledExecutable,
+    )
+
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    class Executable:
+        def __reduce__(self):
+            raise AssertionError("exact leaf executable must not be serialized")
+
+    reduced = []
+
+    class SubLeaf(TorchTpuCompiledExecutable):
+        def __init__(self, tag: str):
+            super().__init__(
+                executable=Executable(),
+                reconstruct_fx_outputs_fn=None,
+                updates_default_generator_state=False,
+            )
+            self.tag = tag
+
+        def __reduce__(self):
+            reduced.append(self.tag)
+            return (_rebuild_subclass_marker, (self.tag,))
+
+    executable = Executable()
+    plain = TorchTpuCompiledExecutable(
+        executable=executable,
+        reconstruct_fx_outputs_fn=None,
+        updates_default_generator_state=False,
+    )
+    entry = SimpleNamespace(plain=plain, sub=SubLeaf("custom"))
+    monkeypatch.setattr(tpu_compiler, "_deserialize_entry", lambda e: e)
+
+    rebuilt = tpu_compiler._rebuild_sharing_executables(entry)
+
+    assert rebuilt.plain is not plain
+    assert rebuilt.plain._executable is executable
+    assert reduced == ["custom"]
+    assert rebuilt.sub == ("subclass-reduced", "custom")
+
+
+def _rebuild_on_loaded_executable_on_tpu(root: str) -> None:
+    """Child-process body of `test_compiled_bucket_reuses_its_executable_on_tpu`."""
+    import torch
+    from torch_tpu._internal.compile.split_compiler import _SplitCompiledExecutable
+    from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
+        TorchTpuCompiledExecutable,
+    )
+    from vllm.config.utils import Range
+
+    from vllm_torchtpu import patch_registry
+    from vllm_torchtpu.compilation import tpu_compiler
+    from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+    from vllm_torchtpu.tpu_info import get_num_chips
+
+    if get_num_chips() == 0:
+        pytest.skip("TPU hardware required")
+    patch_registry.apply("worker_init")
+
+    def leaves_of(entry):
+        result = entry.compiled_fw.result
+        subs = (
+            result.compiled_executables
+            if isinstance(result, _SplitCompiledExecutable)
+            else [result]
+        )
+        return [sub for sub in subs if isinstance(sub, TorchTpuCompiledExecutable)]
+
+    built = []
+    real_backend = tpu_compiler._tpu_backend
+
+    def tracked_backend(graph, example_inputs):
+        compiled_fn = real_backend(graph, example_inputs)
+        leaves = leaves_of(compiled_fn.serialize())
+        built.append([(leaf, leaf._executable) for leaf in leaves])
+        return compiled_fn
+
+    rebuilt = []
+    real_deserialize = tpu_compiler._deserialize_entry
+
+    def tracked_deserialize(entry):
+        rebuilt.append([(leaf, leaf._executable) for leaf in leaves_of(entry)])
+        return real_deserialize(entry)
+
+    read_back = []
+    real_replay = TpuCompilerAdaptor._replay
+
+    def tracked_replay(self, path, *args, **kwargs):
+        read_back.append(path)
+        return real_replay(self, path, *args, **kwargs)
+
+    tpu_compiler._tpu_backend = tracked_backend
+    tpu_compiler._deserialize_entry = tracked_deserialize
+    TpuCompilerAdaptor._replay = tracked_replay
+
+    cache_dir = os.path.join(root, "cache")
+    compiler = TpuCompilerAdaptor()
+    compiler.initialize_cache(cache_dir=cache_dir)
+    compiled = []
+
+    def adaptor_backend(graph, example_inputs):
+        fn, handle = compiler.compile(
+            graph, example_inputs, {}, Range(start=8, end=8), key="bucket_8"
+        )
+        assert fn is not None and handle is not None
+        compiled.append((graph, example_inputs, handle))
+        return fn
+
+    compiled_step = torch.compile(
+        lambda x: x * 2.0 + 1.0, backend=adaptor_backend, fullgraph=True, dynamic=False
+    )
+    x = torch.arange(8, dtype=torch.float32, device="tpu")
+    expected = torch.arange(8, dtype=torch.float32) * 2.0 + 1.0
+    assert torch.equal(compiled_step(x).cpu(), expected)
+
+    # The cold compile ran the runnable rebuilt from the in-process entry: new
+    # leaves on the very executables the backend returned, no artifact read.
+    assert read_back == []
+    assert len(built) == 1 and len(rebuilt) == 1
+    assert len(built[0]) >= 1 and len(rebuilt[0]) == len(built[0])
+    for (old_leaf, old_exe), (new_leaf, new_exe) in zip(built[0], rebuilt[0]):
+        assert new_leaf is not old_leaf
+        assert new_exe is old_exe
+
+    # A warm start still replays the artifact the cold start saved.
+    graph, example_inputs, handle = compiled[0]
+    before = torch.tpu._get_cache_stats().num_compilations
+    warm = TpuCompilerAdaptor()
+    warm.initialize_cache(cache_dir=cache_dir)
+    (out,) = warm.load(handle, graph, example_inputs, 0, Range(start=8, end=8))(x)
+    assert torch.equal(out.cpu(), expected)
+    assert torch.tpu._get_cache_stats().num_compilations == before
+    assert read_back == [handle[1]]
+
+
+@pytest.mark.tpu_test
+@pytest.mark.spawns_tpu_workers
+def test_compiled_bucket_reuses_its_executable_on_tpu(tmp_path, monkeypatch):
+    """Real TpuBackend: a cold compile runs a runnable rebuilt on the loaded
+    executable the backend returned (no second load of the saved artifact),
+    computes the right result, and the artifact still warm-loads."""
+    from functools import partial
+
+    from tests.distributed.tpu_test_utils import run_in_isolated_process
+
+    monkeypatch.setenv("TORCH_TPU_TIER2_COMPILATION_CACHE", "disabled")
+    monkeypatch.delenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT", raising=False)
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "inductor"))
+    monkeypatch.setenv("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
+
+    run_in_isolated_process(
+        partial(_rebuild_on_loaded_executable_on_tpu, str(tmp_path)), timeout=180
+    )
+
+
+class _FakePjrtExecutable:
+    """A loaded executable, as far as `TorchTpuCompiledExecutable` reads one."""
+
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+
+    def serialize_executable(self) -> bytes:
+        return f"pjrt:{self.tag}".encode()
+
+    def subslice_origin(self) -> None:
+        return None
+
+    def fingerprint_executable(self) -> str:
+        return f"fp:{self.tag}"
+
+
+def _passthrough_fx_outputs(orig_args, tpu_outputs):
+    return tpu_outputs
+
+
+def _fake_execute(executable, args, *rest):
+    """Runs `_double` for whichever leaf calls it, boxed inputs or not."""
+    import torch
+    from torch.utils._pytree import tree_leaves
+
+    (x,) = [a for a in tree_leaves(args) if isinstance(a, torch.Tensor)]
+    return (x * 2,)
+
+
+def _fake_leaf(tag: str = "leaf"):
+    from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
+        TorchTpuCompiledExecutable,
+    )
+
+    return TorchTpuCompiledExecutable(
+        executable=_FakePjrtExecutable(tag),
+        reconstruct_fx_outputs_fn=_passthrough_fx_outputs,
+        updates_default_generator_state=False,
+    )
+
+
+class _FakeBaseCompiler:
+    """torch_tpu's per-graph compiler minus XLA: each graph it is handed
+    becomes a leaf on a fake loaded executable."""
+
+    compilation_context = None
+    _debug = None
+
+    def execute_pre_grad_passes(self, graph_module) -> None:
+        pass
+
+    def __call__(self, graph_module, example_inputs, is_fwd=True, **kwargs):
+        return _fake_leaf(str(kwargs.get("module_name")))
+
+
+class _UnknownArtifact:
+    """An artifact `_release_compiled_graph_cycles` does not know."""
+
+
+def _double(x):
+    return x * 2
+
+
+def _leaves_of(result):
+    from torch_tpu._internal.compile.split_compiler import _SplitCompiledExecutable
+
+    if isinstance(result, _SplitCompiledExecutable):
+        return list(result.compiled_executables)
+    return [result]
+
+
+def _artifacts_cell(fn):
+    """The backend runnable's `compiled_artifacts` closure list."""
+    cells = dict(zip(fn.__code__.co_freevars, fn.__closure__))
+    return cells["compiled_artifacts"].cell_contents
+
+
+@pytest.fixture(params=[True, False], ids=["split", "single-leaf"])
+def cpu_tpu_backend(request, monkeypatch):
+    """The real TpuBackend and aot_autograd, compiling each graph -- whole, or
+    split by torch_tpu's SplitCompiler -- to leaves on fake executables, so
+    `compile` and `load` handle the very objects they do on a TPU host.
+
+    Records what each backend call built, and the executables of the leaves
+    each runnable is deserialized on. `loads` lists every executable loaded
+    back from serialized bytes, the second copy a replay costs."""
+    import gc
+
+    import torch
+    from torch._functorch._aot_autograd.autograd_cache import AOTAutogradCache
+    from torch_tpu._internal.compile import _backend, tpu_torch_compile
+    from torch_tpu._internal.compile.split_compiler import SplitCompiler
+
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    split = request.param
+    state = SimpleNamespace(
+        split=split, loads=[], built=[], deserialized=[], extra_artifacts=[]
+    )
+
+    def load_serialized_executable(serialized, subslice_origin=None):
+        state.loads.append(serialized)
+        return _FakePjrtExecutable("loaded")
+
+    monkeypatch.setattr(AOTAutogradCache, "save", staticmethod(lambda *a, **k: None))
+    monkeypatch.setattr(
+        tpu_torch_compile, "serialize_executable", lambda ex: ex.serialize_executable()
+    )
+    monkeypatch.setattr(
+        tpu_torch_compile, "load_serialized_executable", load_serialized_executable
+    )
+    monkeypatch.setattr(tpu_torch_compile, "execute", _fake_execute)
+    monkeypatch.setattr(
+        tpu_torch_compile, "get_handshake_stage_env_var_once", lambda: 0
+    )
+    monkeypatch.setattr(
+        _backend,
+        "make_backend_compiler",
+        lambda *a, **kw: (
+            SplitCompiler(_FakeBaseCompiler()) if split else _FakeBaseCompiler()
+        ),
+    )
+    real_backend = _backend.TpuBackend()
+
+    def backend(graph, example_inputs):
+        fn = real_backend(graph, example_inputs)
+        # Sweep dead Gen-1 closures left by PyTorch's CodeGen._gen_python_code
+        # when automatic GC is active (promoted_to_gen2 already runs collect(1)).
+        if gc.isenabled():
+            gc.collect(1)
+        entry = fn.serialize()
+        result = entry.compiled_fw.result
+        leaves = _leaves_of(result)
+        tracked = {
+            "fn": weakref.ref(fn),
+            "entry": weakref.ref(entry),
+            "result": weakref.ref(result),
+        }
+        tracked.update({f"leaf{i}": weakref.ref(leaf) for i, leaf in enumerate(leaves)})
+        if split:
+            # A constant the split graph holds, as sunk weights would be, plus
+            # unshared node metadata to verify erased nodes and the fx.Graph
+            # itself are freed by refcounting rather than stranded in Gen-2.
+            constant = torch.zeros(16)
+            result._split_gm.sunk_constant = constant
+            split_graph = result._split_gm.graph
+            tracked["split_gm"] = weakref.ref(result._split_gm)
+            tracked["split_graph"] = weakref.ref(split_graph)
+            tracked["constant"] = weakref.ref(constant)
+            for idx, node in enumerate(split_graph.nodes):
+                meta_tensor = torch.zeros(4)
+                node.meta["probe_tensor"] = meta_tensor
+                tracked[f"node_{idx}"] = weakref.ref(node)
+                tracked[f"node_meta_{idx}"] = weakref.ref(meta_tensor)
+        state.built.append(
+            SimpleNamespace(
+                tracked=tracked,
+                executables=[leaf._executable for leaf in leaves],
+            )
+        )
+        _artifacts_cell(fn).extend(state.extra_artifacts)
+        return fn
+
+    real_deserialize = tpu_compiler._deserialize_entry
+
+    def deserialize(entry):
+        leaves = _leaves_of(entry.compiled_fw.result)
+        state.deserialized.append([leaf._executable for leaf in leaves])
+        return real_deserialize(entry)
+
+    monkeypatch.setattr(tpu_compiler, "_tpu_backend", backend)
+    monkeypatch.setattr(tpu_compiler, "_deserialize_entry", deserialize)
+    return state
+
+
+@pytest.fixture
+def promoted_to_gen2(monkeypatch):
+    """Automatic GC off; once `_save_handle` returns, a Gen-1 pass moves
+    everything the in-process compile result holds to Gen-2, where a Gen-0
+    sweep cannot reach it. Yields the generations `gc.collect` is asked for."""
+    import gc
+
+    from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+    real_collect = gc.collect
+    real_save = TpuCompilerAdaptor._save_handle
+
+    def promoting_save(self, *args, **kwargs):
+        saved = real_save(self, *args, **kwargs)
+        real_collect(1)
+        return saved
+
+    generations = []
+
+    def collect(generation=2):
+        generations.append(generation)
+        return real_collect(generation)
+
+    monkeypatch.setattr(TpuCompilerAdaptor, "_save_handle", promoting_save)
+    monkeypatch.setattr(gc, "collect", collect)
+    real_collect()
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield generations
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
+class TestInProcessResultReclaim:
+    """A compiled bucket runs a runnable rebuilt on the executables the backend
+    returned, and the in-process result goes without a full collection."""
+
+    @staticmethod
+    def _graph():
+        import torch
+
+        return torch.fx.symbolic_trace(_double)
+
+    @staticmethod
+    def _compile(tmp_path, graph):
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        compiler = TpuCompilerAdaptor()
+        compiler.initialize_cache(cache_dir=str(tmp_path / "cache"))
+        return compiler.compile(
+            graph, [torch.tensor([3, 4])], {}, Range(start=2, end=2), key="bucket"
+        )
+
+    @staticmethod
+    def _load_stale(tmp_path, graph):
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        compiler = TpuCompilerAdaptor()
+        compiler.initialize_cache(cache_dir=str(tmp_path / "cache"))
+        stale = tmp_path / "cache" / "bucket"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_bytes(b"stale")
+        fn = compiler.load(
+            ("bucket", str(stale), True),
+            graph,
+            [torch.tensor([3, 4])],
+            0,
+            Range(start=2, end=2),
+        )
+        assert stale.read_bytes() != b"stale"
+        return fn
+
+    @staticmethod
+    def _assert_reclaimed(backend):
+        (built,) = backend.built
+        alive = {name for name, ref in built.tracked.items() if ref() is not None}
+        assert alive == set()
+
+    @staticmethod
+    def _assert_runs(fn):
+        import torch
+
+        assert torch.equal(fn(torch.tensor([3, 4])), torch.tensor([6, 8]))
+
+    @pytest.mark.parametrize("path", ["compile", "load"])
+    def test_runs_on_the_same_executables_and_reclaims_with_gen0_only(
+        self, tmp_path, cpu_tpu_backend, promoted_to_gen2, path
+    ):
+        """Even with the in-process result promoted to Gen-2 during the save,
+        a Gen-0 sweep reclaims it: its wrapper, entry, leaves and (split)
+        graph and constants. The runnable that replaces it is new, but runs
+        on the executables the backend returned; none is loaded again."""
+        graph = self._graph()
+        if path == "compile":
+            fn, handle = self._compile(tmp_path, graph)
+            assert handle is not None
+        else:
+            fn = self._load_stale(tmp_path, graph)
+
+        assert promoted_to_gen2 == [0]
+        assert cpu_tpu_backend.loads == []
+        (built,) = cpu_tpu_backend.built
+        (deserialized,) = cpu_tpu_backend.deserialized
+        assert len(deserialized) == len(built.executables) >= 1
+        assert all(new is old for new, old in zip(deserialized, built.executables))
+        self._assert_reclaimed(cpu_tpu_backend)
+        self._assert_runs(fn)
+
+    @pytest.mark.parametrize("cpu_tpu_backend", [True], indirect=True)
+    @pytest.mark.parametrize("path", ["compile", "load"])
+    def test_gen2_split_graph_survives_gen0_without_cycle_breaking(
+        self, tmp_path, monkeypatch, cpu_tpu_backend, promoted_to_gen2, path
+    ):
+        """Negative control: with `_release_compiled_graph_cycles` stubbed out,
+        the Gen-2 promoted `_split_gm`, its `fx.Graph`, and constants survive
+        `gc.collect(0)` and are only freed by a full `gc.collect()`."""
+        import gc
+
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        monkeypatch.setattr(
+            tpu_compiler, "_release_compiled_graph_cycles", lambda *a, **k: True
+        )
+        graph = self._graph()
+        if path == "compile":
+            fn, handle = self._compile(tmp_path, graph)
+            assert handle is not None
+        else:
+            fn = self._load_stale(tmp_path, graph)
+
+        assert promoted_to_gen2 == [0]
+        (built,) = cpu_tpu_backend.built
+        alive = {name for name, ref in built.tracked.items() if ref() is not None}
+        assert {"split_gm", "split_graph", "constant"} <= alive
+        self._assert_runs(fn)
+        gc.collect()
+        self._assert_reclaimed(cpu_tpu_backend)
+
+    @pytest.mark.parametrize("path", ["compile", "load"])
+    def test_leaves_the_caller_graph_intact(self, tmp_path, cpu_tpu_backend, path):
+        """The graph vLLM passed in -- from which `shape_variants` reads the
+        placeholder signature -- is not dismantled with the in-process result."""
+        from vllm_torchtpu.compilation import shape_variants
+
+        remembered = []
+        real_remember = shape_variants.remember
+
+        def remember(cache_dir, key, graph, fn):
+            remembered.append(graph)
+            return real_remember(cache_dir, key, graph, fn)
+
+        with (
+            shape_variants.warmup(),
+            patch.object(shape_variants, "remember", remember),
+        ):
+            graph = self._graph()
+            code = graph.code
+            nodes = [(n.name, n.op, n.args) for n in graph.graph.nodes]
+            metas = [n.meta for n in graph.graph.nodes]
+            meta_items = [dict(m) for m in metas]
+            if path == "compile":
+                fn, _ = self._compile(tmp_path, graph)
+            else:
+                fn = self._load_stale(tmp_path, graph)
+            handed = shape_variants.runnable_for(
+                str(tmp_path / "cache"), "bucket", self._graph(), 2
+            )
+
+        assert graph.code == code
+        assert [(n.name, n.op, n.args) for n in graph.graph.nodes] == nodes
+        assert [n.meta for n in graph.graph.nodes] == meta_items
+        assert all(a is b for a, b in zip([n.meta for n in graph.graph.nodes], metas))
+        assert graph.graph.owning_module is graph
+        (kept,) = remembered
+        assert kept is graph
+        assert handed is fn
+        if cpu_tpu_backend.split:
+            # ... while the in-process split graph was dismantled and reclaimed.
+            self._assert_reclaimed(cpu_tpu_backend)
+        self._assert_runs(fn)
+
+    @pytest.mark.parametrize("path", ["compile", "load"])
+    def test_a_changed_leaf_constructor_replays_the_artifact(
+        self, tmp_path, monkeypatch, cpu_tpu_backend, path
+    ):
+        """If torch_tpu's leaf constructor no longer takes the arguments a
+        leaf is rebuilt from, the bucket replays its artifact (a second load)
+        instead of building leaves that miss one."""
+        from vllm.logger import _print_warning_once
+
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        _print_warning_once.cache_clear()
+        monkeypatch.setattr(tpu_compiler, "_TORCH_TPU_EXEC_INIT_MATCHES", False)
+        graph = self._graph()
+        with TestTpuCompilerCache._capture_vllm_info() as messages:
+            if path == "compile":
+                fn, handle = self._compile(tmp_path, graph)
+                assert handle is not None
+            else:
+                fn = self._load_stale(tmp_path, graph)
+
+        assert any(
+            "Could not rebuild the runnable on its loaded executable" in m
+            and "TorchTpuCompiledExecutable.__init__ takes" in m
+            for m in messages
+        )
+        (built,) = cpu_tpu_backend.built
+        assert len(cpu_tpu_backend.loads) == len(built.executables)
+        (deserialized,) = cpu_tpu_backend.deserialized
+        assert all(new is not old for new, old in zip(deserialized, built.executables))
+        self._assert_reclaimed(cpu_tpu_backend)
+        self._assert_runs(fn)
+
+    def test_a_changed_leaf_constructor_is_reported_once(
+        self, tmp_path, monkeypatch, cpu_tpu_backend
+    ):
+        """A changed leaf constructor fails the rebuild of every bucket the
+        same way, so it is reported once per process, not once per bucket."""
+        import torch
+        from vllm.config.utils import Range
+        from vllm.logger import _print_warning_once
+
+        from vllm_torchtpu.compilation import tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        _print_warning_once.cache_clear()
+        monkeypatch.setattr(tpu_compiler, "_TORCH_TPU_EXEC_INIT_MATCHES", False)
+        compiler = TpuCompilerAdaptor()
+        compiler.initialize_cache(cache_dir=str(tmp_path / "cache"))
+        with TestTpuCompilerCache._capture_vllm_info() as messages:
+            for key in ("bucket_a", "bucket_b"):
+                fn, handle = compiler.compile(
+                    self._graph(),
+                    [torch.tensor([3, 4])],
+                    {},
+                    Range(start=2, end=2),
+                    key=key,
+                )
+                assert handle is not None
+                self._assert_runs(fn)
+
+        assert (
+            sum("TorchTpuCompiledExecutable.__init__ takes" in m for m in messages) == 1
+        )
+        assert len(cpu_tpu_backend.built) == 2
+        assert len(cpu_tpu_backend.loads) == sum(
+            len(built.executables) for built in cpu_tpu_backend.built
+        )
+
+    @pytest.mark.parametrize(
+        "reason", ["reload_failed", "cache_disabled"], ids=["reload-failed", "no-save"]
+    )
+    @pytest.mark.parametrize("path", ["compile", "load"])
+    def test_keeps_the_in_process_result_intact_when_not_reloaded(
+        self, tmp_path, monkeypatch, cpu_tpu_backend, path, reason
+    ):
+        """When no rebuilt or replayed runnable replaces the in-process compile
+        result, its split FX graph, metadata and backend closure stay intact."""
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation import tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        graph = self._graph()
+        if reason == "reload_failed":
+
+            def cannot_rebuild(entry):
+                raise TypeError("unsupported entry")
+
+            monkeypatch.setattr(
+                tpu_compiler, "_rebuild_sharing_executables", cannot_rebuild
+            )
+            monkeypatch.setattr(TpuCompilerAdaptor, "_replay", lambda *a, **kw: None)
+            if path == "compile":
+                fn, handle = self._compile(tmp_path, graph)
+                assert handle is not None
+            else:
+                fn = self._load_stale(tmp_path, graph)
+        else:
+            compiler = TpuCompilerAdaptor()
+            compiler.initialize_cache(
+                cache_dir=str(tmp_path / "cache"), disable_cache=True
+            )
+            if path == "compile":
+                fn, handle = compiler.compile(
+                    graph,
+                    [torch.tensor([3, 4])],
+                    {},
+                    Range(start=2, end=2),
+                    key="bucket",
+                )
+                assert handle is None
+            else:
+                stale = tmp_path / "cache" / "bucket"
+                stale.parent.mkdir(parents=True, exist_ok=True)
+                stale.write_bytes(b"stale")
+                fn = compiler.load(
+                    ("bucket", str(stale), True),
+                    graph,
+                    [torch.tensor([3, 4])],
+                    0,
+                    Range(start=2, end=2),
+                )
+                assert stale.read_bytes() == b"stale"
+
+        assert cpu_tpu_backend.loads == []
+        assert cpu_tpu_backend.deserialized == []
+        (built,) = cpu_tpu_backend.built
+        backend_fn = built.tracked["fn"]()
+        result = built.tracked["result"]()
+        assert backend_fn is not None and result is not None
+        assert len(_artifacts_cell(backend_fn)) >= 1
+        if cpu_tpu_backend.split:
+            split_gm = built.tracked["split_gm"]()
+            assert split_gm is not None
+            assert len(list(split_gm.graph.nodes)) >= 1
+            assert split_gm.graph.owning_module is split_gm
+            assert result._graph_module_str is not None
+        self._assert_runs(fn)
+
+    @pytest.mark.parametrize("path", ["compile", "load"])
+    def test_an_unknown_artifact_falls_back_to_a_full_collection(
+        self, tmp_path, cpu_tpu_backend, promoted_to_gen2, path
+    ):
+        """An artifact of a type it does not know may hold cycles of its own:
+        the known ones are still dismantled, but a full collection runs."""
+        cpu_tpu_backend.extra_artifacts.append(_UnknownArtifact())
+        graph = self._graph()
+        if path == "compile":
+            fn, _ = self._compile(tmp_path, graph)
+        else:
+            fn = self._load_stale(tmp_path, graph)
+
+        assert promoted_to_gen2 == [2]
+        self._assert_reclaimed(cpu_tpu_backend)
+        self._assert_runs(fn)
+
+
+def test_the_pinned_torch_tpu_leaf_constructor_is_the_one_rebuilt_from():
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    assert tpu_compiler._TORCH_TPU_EXEC_INIT_MATCHES
+
+
+def _tag_first_outputs(orig_args, tpu_outputs):
+    return ("first", tpu_outputs)
+
+
+def _tag_second_outputs(orig_args, tpu_outputs):
+    return ("second", tpu_outputs)
+
+
+def test_rebuild_sharing_executables_keeps_distinct_leaves_on_shared_executable(
+    monkeypatch,
+):
+    """Two distinct leaves backed by the same Tier-1-cached `_executable` keep
+    their own output reconstruction and flags while sharing `_executable`."""
+    from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
+        TorchTpuCompiledExecutable,
+    )
+
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    class Executable:
+        def __reduce__(self):
+            raise AssertionError("the executable must not be serialized")
+
+    shared = Executable()
+    first = TorchTpuCompiledExecutable(
+        executable=shared,
+        reconstruct_fx_outputs_fn=_tag_first_outputs,
+        updates_default_generator_state=False,
+        dynamic_outputs=[False],
+        unique_output_indices=[0],
+    )
+    second = TorchTpuCompiledExecutable(
+        executable=shared,
+        reconstruct_fx_outputs_fn=_tag_second_outputs,
+        updates_default_generator_state=True,
+        dynamic_outputs=[True, False],
+        unique_output_indices=[1, 0],
+    )
+    entry = SimpleNamespace(a=first, same_a=first, b=second)
+    monkeypatch.setattr(tpu_compiler, "_deserialize_entry", lambda e: e)
+
+    rebuilt = tpu_compiler._rebuild_sharing_executables(entry)
+
+    assert rebuilt.a is not first and rebuilt.a is rebuilt.same_a
+    assert rebuilt.b is not second and rebuilt.b is not rebuilt.a
+    assert rebuilt.a._executable is shared and rebuilt.b._executable is shared
+    assert rebuilt.a._reconstruct_fx_outputs_fn([], ["x"]) == ("first", ["x"])
+    assert rebuilt.b._reconstruct_fx_outputs_fn([], ["x"]) == ("second", ["x"])
+    assert rebuilt.a._updates_default_generator_state is False
+    assert rebuilt.b._updates_default_generator_state is True
+    assert rebuilt.a._dynamic_outputs == [False]
+    assert rebuilt.b._dynamic_outputs == [True, False]
+    assert rebuilt.a._unique_output_indices == [0]
+    assert rebuilt.b._unique_output_indices == [1, 0]
+
+
+def test_rebuild_sharing_executables_refuses_a_changed_leaf_constructor(monkeypatch):
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    monkeypatch.setattr(tpu_compiler, "_TORCH_TPU_EXEC_INIT_MATCHES", False)
+    monkeypatch.setattr(tpu_compiler, "_deserialize_entry", lambda e: e)
+    with pytest.raises(TypeError, match=r"TorchTpuCompiledExecutable.__init__ takes"):
+        tpu_compiler._rebuild_sharing_executables(SimpleNamespace(fw=_fake_leaf()))
+
+
+def _split_artifact(graph_module, leaves=(), recompile_fn=None):
+    """A `_SplitCompiledExecutable` over `graph_module`, with `leaves` attached
+    to it the way SplitCompiler attaches compiled submodules."""
+    from torch_tpu._internal.compile.split_compiler import (
+        _SplitCompiledExecutable,
+        _WrapperModule,
+    )
+
+    for i, leaf in enumerate(leaves):
+        graph_module.add_submodule(f"submod_{i}", _WrapperModule(leaf, False))
+    return _SplitCompiledExecutable(
+        target=graph_module, recompile_fn=recompile_fn, graph_module_str="graph"
+    )
+
+
+def _bundled(fw, bw=None, *, has_bw=True):
+    entry = SimpleNamespace(compiled_fw=SimpleNamespace(result=fw))
+    entry.compiled_bw = SimpleNamespace(result=bw) if has_bw else None
+    return entry
+
+
+def test_release_compiled_graph_cycles_frees_split_graphs_by_refcount():
+    """The split graph, its fx.Graph/nodes/meta/codegen, a graph its
+    `recompile_fn` holds, and the backend's closure list are dismantled, so
+    refcounting alone frees them; leaf executables stay for the rebuilt
+    runnable."""
+    import collections
+    import functools
+    import gc
+
+    import torch
+    from torch_tpu._internal.compile.split_compiler import (
+        _register_output_namedtuple_globals,
+    )
+
+    from vllm_torchtpu.compilation.tpu_compiler import _release_compiled_graph_cycles
+
+    leaf = _fake_leaf()
+    executable = leaf._executable
+    NamedOut = collections.namedtuple("NamedOut", ["y"])
+    fw_gm = torch.fx.symbolic_trace(lambda x: NamedOut(y=x * 2))
+    _register_output_namedtuple_globals(fw_gm)
+    fw_gm.recompile()
+    unshared_meta_tensor = torch.zeros(4)
+    first_node = next(iter(fw_gm.graph.nodes))
+    first_node.meta["probe"] = unshared_meta_tensor
+    recompile_gm = torch.fx.symbolic_trace(_double)
+    split = _split_artifact(
+        fw_gm,
+        [leaf, leaf],
+        recompile_fn=functools.partial(lambda gm, tag: gm, recompile_gm, "tag"),
+    )
+    closure_gm = torch.fx.symbolic_trace(_double)
+    closure_split = _split_artifact(closure_gm)
+    compiled_artifacts = [split, closure_split, None, leaf]
+
+    def backend_fn():
+        return compiled_artifacts
+
+    refs = [
+        weakref.ref(obj)
+        for obj in (
+            fw_gm,
+            fw_gm.graph,
+            fw_gm.graph._codegen,
+            first_node,
+            unshared_meta_tensor,
+            recompile_gm,
+            recompile_gm.graph,
+            closure_gm,
+            closure_gm.graph,
+        )
+    ]
+    entry = _bundled(split, None)
+    del fw_gm, first_node, unshared_meta_tensor, recompile_gm, closure_gm
+
+    # Sweep cyclic fx.Tracer instances from symbolic_trace setup before
+    # disabling GC so the assertion tests pure refcounting on the artifacts.
+    gc.collect()
+    gc.disable()
+    try:
+        assert _release_compiled_graph_cycles(backend_fn, entry) is True
+        assert compiled_artifacts == []
+        assert split.recompile_fn is None
+        assert split._graph_module_str is None
+        assert split.compiled_executables == [leaf, leaf]
+        assert leaf._executable is executable
+        del split, closure_split, entry
+        assert [ref() for ref in refs] == [None] * len(refs)
+    finally:
+        gc.enable()
+
+
+def test_release_compiled_graph_cycles_leaves_preserved_graphs_and_meta():
+    """GraphModules under `preserve` keep their nodes, and a node `meta` dict
+    shared with a dismantled graph is not emptied."""
+    import functools
+
+    import torch
+
+    from vllm_torchtpu.compilation.tpu_compiler import _release_compiled_graph_cycles
+
+    caller = torch.fx.symbolic_trace(_double)
+    split_gm = torch.fx.symbolic_trace(_double)
+    for shared, node in zip(caller.graph.nodes, split_gm.graph.nodes):
+        shared.meta["val"] = "shared"
+        node.meta = shared.meta
+    child = torch.fx.symbolic_trace(_double)
+    split_gm.add_submodule("child", child)
+    split_gm.add_submodule("plain", torch.nn.Linear(1, 1))
+    caller.add_submodule("child", child)
+    split = _split_artifact(
+        split_gm, recompile_fn=functools.partial(lambda gm: gm, caller)
+    )
+
+    assert _release_compiled_graph_cycles(
+        None, _bundled(split, has_bw=False), preserve=(caller, "not a module")
+    )
+
+    assert list(split_gm.graph.nodes) == []
+    assert split_gm.graph.owning_module is None
+    assert not split_gm.graph._graph_namespace._obj_to_name
+    for module in (caller, child):
+        assert [n.op for n in module.graph.nodes] == [
+            "placeholder",
+            "call_function",
+            "output",
+        ]
+        assert module.graph.owning_module is module
+    assert all(n.meta == {"val": "shared"} for n in caller.graph.nodes)
+
+
+@pytest.mark.parametrize(
+    "where", ["entry", "split", "closure"], ids=["in-entry", "in-split", "in-closure"]
+)
+def test_release_compiled_graph_cycles_reports_an_async_artifact(where):
+    """An unresolved `AsyncCompiledArtifact` (or any unknown artifact) makes it
+    return False, but the split graphs it knows are still dismantled."""
+    import concurrent.futures
+
+    import torch
+    from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
+        AsyncCompiledArtifact,
+        NoOpCompiledArtifact,
+    )
+
+    from vllm_torchtpu.compilation.tpu_compiler import _release_compiled_graph_cycles
+
+    pending = AsyncCompiledArtifact(concurrent.futures.Future())
+    gm = torch.fx.symbolic_trace(_double)
+    split = _split_artifact(
+        gm, [_fake_leaf(), pending] if where == "split" else [_fake_leaf()]
+    )
+    compiled_artifacts = [pending] if where == "closure" else []
+
+    def backend_fn():
+        return compiled_artifacts
+
+    bw = pending if where == "entry" else NoOpCompiledArtifact(None)
+    assert _release_compiled_graph_cycles(backend_fn, _bundled(split, bw)) is False
+    assert list(gm.graph.nodes) == []
+    assert gm.graph.owning_module is None
+    assert not pending.is_resolved
+
+
+def test_saving_the_entry_resolves_an_async_artifact(monkeypatch):
+    """`compile` and `load` release the in-process result only after
+    `_save_handle` pickled its entry. Pickling resolves an
+    `AsyncCompiledArtifact` into the leaf it wraps, so the release then
+    counts it as known."""
+    import concurrent.futures
+    import pickle
+
+    from torch_tpu._internal.compile import tpu_torch_compile
+    from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
+        AsyncCompiledArtifact,
+        TorchTpuCompiledExecutable,
+    )
+
+    from vllm_torchtpu.compilation.tpu_compiler import _release_compiled_graph_cycles
+
+    monkeypatch.setattr(
+        tpu_torch_compile, "serialize_executable", lambda ex: ex.serialize_executable()
+    )
+    done = concurrent.futures.Future()
+    done.set_result(_fake_leaf())
+    pending = AsyncCompiledArtifact(done)
+    entry = _bundled(pending, has_bw=False)
+    assert _release_compiled_graph_cycles(None, entry) is False
+
+    pending = AsyncCompiledArtifact(done)
+    entry = _bundled(pending, has_bw=False)
+    pickle.dumps(entry)
+
+    assert type(pending) is TorchTpuCompiledExecutable
+    assert _release_compiled_graph_cycles(None, entry) is True
+
+
+def test_release_compiled_graph_cycles_needs_a_forward_artifact():
+    from vllm_torchtpu.compilation.tpu_compiler import _release_compiled_graph_cycles
+
+    assert _release_compiled_graph_cycles(None, None) is False
+    assert _release_compiled_graph_cycles(None, "entry") is False
+    assert _release_compiled_graph_cycles(None, _bundled(None)) is False
+    assert (
+        _release_compiled_graph_cycles(None, SimpleNamespace(compiled_fw=object()))
+        is False
+    )
+    assert _release_compiled_graph_cycles(None, _bundled(_fake_leaf())) is True
+
+
+def test_release_compiled_graph_cycles_reports_unknown_wrapped_submod():
+    """A `_WrapperModule` holding a non-`CompiledArtifact` is skipped by
+    `_SplitCompiledExecutable.compiled_executables`, yet must still force a
+    full collection while known graphs are dismantled."""
+    import torch
+
+    from vllm_torchtpu.compilation.tpu_compiler import _release_compiled_graph_cycles
+
+    gm = torch.fx.symbolic_trace(_double)
+    split = _split_artifact(gm, [_fake_leaf(), _UnknownArtifact()])
+    assert _release_compiled_graph_cycles(None, _bundled(split)) is False
+    assert list(gm.graph.nodes) == []
+    assert gm.graph.owning_module is None
+
+
+@pytest.mark.parametrize("gen0_suffices", [True, False])
+def test_collect_dropped_result_sweeps_gen0_only_when_it_suffices(
+    monkeypatch, gen0_suffices
+):
+    import gc
+
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    calls = []
+    monkeypatch.setattr(gc, "collect", lambda *args: calls.append(args) or 0)
+    tpu_compiler._collect_dropped_result(gen0_suffices)
+    assert calls == ([(0,)] if gen0_suffices else [()])
+
+
+@pytest.mark.parametrize("was_wrapped", [True, False], ids=["wrapped", "tuple-output"])
+def test_compile_unwraps_once_and_releases_backend_fn_before_peer_clear(
+    tmp_path, monkeypatch, cpu_tpu_backend, was_wrapped
+):
+    """`compile` wraps only the final runnable (never wrapping `backend_fn` and
+    then discarding that closure), so `backend_fn` and `entry` are already freed
+    by refcounting before `_clear_failed` runs."""
+    import gc
+
+    import torch
+    from vllm.config.utils import Range
+
+    from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "1")
+    unwrap_calls = []
+    real_unwrap = TpuCompilerAdaptor._unwrap_compiled_fn
+
+    def spy_unwrap(fn):
+        unwrap_calls.append(fn)
+        return real_unwrap(fn)
+
+    alive_at_clear = []
+    real_clear = TpuCompilerAdaptor._clear_failed
+
+    def spy_clear(self, key):
+        (built,) = cpu_tpu_backend.built
+        alive_at_clear.append(
+            {k for k in ("fn", "entry") if built.tracked[k]() is not None}
+        )
+        return real_clear(self, key)
+
+    monkeypatch.setattr(
+        TpuCompilerAdaptor, "_unwrap_compiled_fn", staticmethod(spy_unwrap)
+    )
+    monkeypatch.setattr(TpuCompilerAdaptor, "_clear_failed", spy_clear)
+
+    graph = torch.fx.symbolic_trace(_double if was_wrapped else lambda x: (_double(x),))
+    compiler = TpuCompilerAdaptor()
+    compiler.initialize_cache(
+        cache_dir=str(tmp_path / "hash" / "rank_0_0" / "backbone")
+    )
+
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        fn, handle = compiler.compile(
+            graph, [torch.tensor([3, 4])], {}, Range(start=2, end=2), key="bucket"
+        )
+    finally:
+        if was_enabled:
+            gc.enable()
+
+    assert handle == (
+        "bucket",
+        str(tmp_path / "hash" / "rank_0_0" / "backbone" / "bucket"),
+        was_wrapped,
+    )
+    assert len(unwrap_calls) == (1 if was_wrapped else 0)
+    assert alive_at_clear == [set()]
+    out = fn(torch.tensor([3, 4]))
+    if was_wrapped:
+        assert torch.equal(out, torch.tensor([6, 8]))
+    else:
+        assert isinstance(out, (tuple, list)) and len(out) == 1
+        assert torch.equal(out[0], torch.tensor([6, 8]))
+
+
+def test_reclaims_the_temporary_graph_deepcopy(
+    tmp_path, monkeypatch, cpu_tpu_backend, promoted_to_gen2
+):
+    """The temporary `deepcopy(orig_graph)` used for tuple-output rewriting is
+    dismantled and freed without a full collection across cold `compile`,
+    warm `load`, stale-artifact `load`, and peer-replayed `compile`."""
+    import copy
+
+    import torch
+    from vllm.config.utils import Range
+
+    from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+    helper = TestInProcessResultReclaim()
+    orig_graph = helper._graph()
+    deepcopies = []
+    real_deepcopy = copy.deepcopy
+
+    def spy_deepcopy(obj, *args, **kwargs):
+        res = real_deepcopy(obj, *args, **kwargs)
+        if obj is orig_graph:
+            deepcopies.append(
+                (
+                    weakref.ref(res),
+                    weakref.ref(res.graph),
+                    [weakref.ref(n) for n in res.graph.nodes],
+                )
+            )
+        return res
+
+    monkeypatch.setattr(copy, "deepcopy", spy_deepcopy)
+
+    # 1. Cold compile (promoted to Gen-2 during _save_handle)
+    fn_cold, handle_cold = helper._compile(tmp_path / "cold", orig_graph)
+    assert handle_cold is not None
+    w_gm, w_graph, w_nodes = deepcopies.pop()
+    assert promoted_to_gen2 == [0]
+    assert w_gm() is None and w_graph() is None
+    assert all(w() is None for w in w_nodes)
+    helper._assert_runs(fn_cold)
+
+    # 2. Warm load (replayed from disk; refcount drops dismantled copy)
+    warm = TpuCompilerAdaptor()
+    warm.initialize_cache(cache_dir=str(tmp_path / "cold" / "cache"))
+    fn_warm = warm.load(
+        handle_cold, orig_graph, [torch.tensor([3, 4])], 0, Range(start=2, end=2)
+    )
+    w_gm, w_graph, _ = deepcopies.pop()
+    assert w_gm() is None and w_graph() is None
+    helper._assert_runs(fn_warm)
+
+    # 3. Stale load (self-heal recompile promoted to Gen-2 during _save_handle)
+    fn_stale = helper._load_stale(tmp_path / "stale", orig_graph)
+    w_gm, w_graph, w_nodes = deepcopies.pop()
+    assert promoted_to_gen2 == [0, 0]
+    assert w_gm() is None and w_graph() is None
+    assert all(w() is None for w in w_nodes)
+    helper._assert_runs(fn_stale)
+
+    # 4. Peer-replayed compile (rank 1 replays rank 0's artifact)
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "1")
+    built_before = len(cpu_tpu_backend.built)
+    rank0 = TpuCompilerAdaptor()
+    rank0.initialize_cache(cache_dir=str(tmp_path / "peer" / "rank_0_0" / "backbone"))
+    _, h0 = rank0.compile(
+        orig_graph, [torch.tensor([3, 4])], {}, Range(start=2, end=2), key="b_peer"
+    )
+    assert h0 is not None
+    w_gm, w_graph, w_nodes = deepcopies.pop()
+    assert w_gm() is None and w_graph() is None
+    assert all(w() is None for w in w_nodes)
+
+    rank1 = TpuCompilerAdaptor()
+    rank1.initialize_cache(cache_dir=str(tmp_path / "peer" / "rank_1_0" / "backbone"))
+    fn_peer, h1 = rank1.compile(
+        orig_graph, [torch.tensor([3, 4])], {}, Range(start=2, end=2), key="b_peer"
+    )
+    assert h1 is not None
+    assert len(cpu_tpu_backend.built) == built_before + 1
+    w_gm, w_graph, _ = deepcopies.pop()
+    assert w_gm() is None and w_graph() is None
+    helper._assert_runs(fn_peer)
+
+    # 5. Replay deserialize failure in load() does not pin graph/entry via traceback
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    real_deserialize = tpu_compiler._deserialize_entry
+    calls = 0
+
+    def fail_once(entry):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("corrupt entry")
+        return real_deserialize(entry)
+
+    with monkeypatch.context() as m:
+        m.setattr(tpu_compiler, "_deserialize_entry", fail_once)
+        fn_healed = warm.load(
+            handle_cold, orig_graph, [torch.tensor([3, 4])], 0, Range(start=2, end=2)
+        )
+    w_gm, w_graph, w_nodes = deepcopies.pop()
+    assert w_gm() is None and w_graph() is None
+    assert all(w() is None for w in w_nodes)
+    helper._assert_runs(fn_healed)
+
+    # 6. Save failure in _save_handle does not pin entry via logged exception traceback
+    import pickle
+
+    def fail_dump(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    with monkeypatch.context() as m:
+        m.setattr(pickle, "dump", fail_dump)
+        fn_nosave, h_nosave = helper._compile(tmp_path / "nosave", orig_graph)
+    assert h_nosave is None
+    deepcopies.pop()
+    helper._assert_runs(fn_nosave)
+    del fn_nosave
+    assert cpu_tpu_backend.built[-1].tracked["entry"]() is None
+
+
+def test_break_fx_graph_cycles_is_idempotent_and_safe_to_iterate():
+    """Iterating or re-dismantling a graph after `_break_fx_graph_cycles` must
+    remain safe (no C++ `_NodeIter` segfault on `_root` links), including when
+    `_release_compiled_graph_cycles` dismantles a `graph` copy that
+    `_drop_graph_copy` later visits."""
+    import copy
+    import functools
+    import gc
+
+    import torch
+
+    from vllm_torchtpu.compilation.tpu_compiler import (
+        _break_fx_graph_cycles,
+        _drop_graph_copy,
+        _release_compiled_graph_cycles,
+    )
+
+    gm = torch.fx.symbolic_trace(_double)
+    _break_fx_graph_cycles(gm, set())
+    assert list(gm.graph.nodes) == []
+    assert isinstance(str(gm.graph), str)
+    _break_fx_graph_cycles(gm, set())
+    assert list(gm.graph.nodes) == []
+
+    orig_graph = torch.fx.symbolic_trace(_double)
+    graph = copy.deepcopy(orig_graph)
+    split_gm = torch.fx.symbolic_trace(_double)
+    split = _split_artifact(
+        split_gm, recompile_fn=functools.partial(lambda g: g, graph)
+    )
+    w_gm = weakref.ref(graph)
+    w_graph = weakref.ref(graph.graph)
+    w_split_gm = weakref.ref(split_gm)
+    w_split_graph = weakref.ref(split_gm.graph)
+    del split_gm
+
+    gc.collect()
+    gc.disable()
+    try:
+        assert (
+            _release_compiled_graph_cycles(
+                None, _bundled(split, has_bw=False), preserve=(orig_graph,)
+            )
+            is True
+        )
+        assert list(graph.graph.nodes) == []
+        _drop_graph_copy(graph, orig_graph)
+        assert list(graph.graph.nodes) == []
+        del split, graph
+        assert w_gm() is None and w_graph() is None
+        assert w_split_gm() is None and w_split_graph() is None
+    finally:
+        gc.enable()
+
+    assert [n.op for n in orig_graph.graph.nodes] == [
+        "placeholder",
+        "call_function",
+        "output",
+    ]
