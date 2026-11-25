@@ -11,7 +11,7 @@ import os
 import tempfile
 from contextlib import ExitStack
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import jax
 import numpy as np
@@ -508,6 +508,60 @@ def _fused_hash_op():
     return _FUSED_HASH_OP
 
 
+_GATE_OPS: dict[bool, Any] = {}
+
+
+def initialize_engram_gate() -> None:
+    """Register the ``engram_gate`` ops (unmasked, masked) outside any trace;
+    models with Engram layers call this at init."""
+    if _GATE_OPS:
+        return
+    from jax.sharding import PartitionSpec as P
+    from torch_tpu._internal import pallas
+
+    from vllm_torchtpu.kernels.deepseek_v41.engram_gate import engram_gate
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        get_pallas_op_mesh,
+    )
+
+    # jax_op requires every argument named and annotated.
+    def gate(
+        hidden: jax.Array,
+        kv: jax.Array,
+        q_weight: jax.Array,
+        k_weight: jax.Array,
+        eps: float,
+        clamp: float,
+    ) -> jax.Array:
+        return engram_gate(hidden, kv, q_weight, k_weight, eps=eps, clamp=clamp)
+
+    def masked_gate(
+        hidden: jax.Array,
+        kv: jax.Array,
+        q_weight: jax.Array,
+        k_weight: jax.Array,
+        token_mask: jax.Array,
+        eps: float,
+        clamp: float,
+    ) -> jax.Array:
+        return engram_gate(
+            hidden, kv, q_weight, k_weight, token_mask, eps=eps, clamp=clamp
+        )
+
+    for masked, fn in ((False, gate), (True, masked_gate)):
+        arrays = 5 if masked else 4
+        op = pallas.jax_op(
+            "pallas::dsv41_engram_gate" + ("_masked" if masked else ""),
+            fn,
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=cast(
+                tuple[tuple[str, ...], ...], (P(),) * arrays + (None,) * 2
+            ),
+        )
+        op.register_fake(lambda hidden, *_: torch.empty_like(hidden))
+        _GATE_OPS[masked] = op
+
+
 _FUSED_PREP_OP = None
 
 
@@ -778,6 +832,16 @@ class DPSharedEngramStorage(upstream.DPSharedEngramStorage):
         return self.weight, self.weight_scale_inv
 
 
+class HeadShard(NamedTuple):
+    """One rank's hash heads and their global table rows, over ``node_size`` ranks."""
+
+    node_size: int
+    head_start: int
+    part_cols: int
+    vocab_start: int
+    vocab_end: int
+
+
 class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
     """Reuse upstream head sharding and checkpoint loaders; support Host DRAM."""
 
@@ -802,11 +866,15 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
 
     def __init__(
         self,
+        num_embeddings: int,
+        dim: int,
+        head_sizes: tuple[int, ...],
         *args,
         cpu_offload: bool | None = None,
         dp_shared_memory: bool = False,
         **kwargs,
     ):
+        self.head_sizes = tuple(head_sizes)
         # Upstream's own `cpu_offload` means a pinned table read through UVA
         # (CUDA only) and it resets the attribute in `__init__`; keep it False
         # and track the TPU host table separately.
@@ -829,7 +897,9 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
             torch.cuda,
             get_device_properties=lambda _: SimpleNamespace(multi_processor_count=0),
         ):
-            super().__init__(*args, cpu_offload=False, **kwargs)
+            super().__init__(
+                num_embeddings, dim, head_sizes, *args, cpu_offload=False, **kwargs
+            )
         if self.tpu_dp_shared_memory:
             self.dp_size = 1
         upstream.set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
@@ -842,6 +912,43 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         if self.tpu_dp_shared_memory:
             return self.tp_size, upstream.get_tensor_model_parallel_rank()
         return super()._get_shard_info()
+
+    @property
+    def node_size(self) -> int:
+        """Ranks of the node-local Engram DP group the heads shard over (1: none)."""
+        if not self.tpu_dp_shared_memory:
+            return self.dp_size
+        group = upstream.get_engram_dp_group()
+        return group.world_size if group is not None else 1
+
+    def node_head_shard(self) -> HeadShard:
+        """This rank's head shard over the node-local Engram DP group.
+
+        A head-sharded host table holds exactly this shard. A DP-shared table
+        holds every head; the shard is then the one upstream's head sharding
+        would give this rank over the group (``engram_hbm`` serves it from HBM).
+        """
+        if not self.tpu_dp_shared_memory:
+            return HeadShard(
+                self.dp_size,
+                self.head_start,
+                self.part_n_hash_cols,
+                self.vocab_start_idx,
+                self.vocab_end_idx,
+            )
+        group = upstream.get_engram_dp_group()
+        assert group is not None  # dp_shared_memory requires one (see __init__)
+        part_cols = -(-self.n_hash_cols // group.world_size)
+        # Upstream's head-sharding precondition: every rank holds a head.
+        assert (group.world_size - 1) * part_cols < self.n_hash_cols
+        head_start = group.rank_in_group * part_cols
+        return HeadShard(
+            group.world_size,
+            head_start,
+            part_cols,
+            sum(self.head_sizes[:head_start]),
+            sum(self.head_sizes[: head_start + part_cols]),
+        )
 
     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self.tpu_dp_shared_memory:
@@ -1234,15 +1341,17 @@ class Engram(upstream.Engram):
         if self._uses_hbm is None:
             from .engram_hbm import should_use_hbm_lookup
 
+            emb = self.embed_tokens
             self._uses_hbm = should_use_hbm_lookup(
                 staged_raw=self._staged_raw,
-                dp_size=int(self.embed_tokens.dp_size),
+                dp_size=emb.node_size,
                 layer_hash_index=int(self.layer_hash_index),
+                dp_shared=emb.tpu_dp_shared_memory,
             )
         return self._uses_hbm
 
     def upload_hbm_table(self):
-        """Copy this rank's host head shard to HBM once; returns
+        """Copy this rank's head shard of the host table to HBM once; returns
         (table, scales, shard metadata, rows per rank)."""
         if self._hbm_table is not None:
             return self._hbm_table
@@ -1251,12 +1360,16 @@ class Engram(upstream.Engram):
         from .engram_hbm import build_lookup_op, gather_shard_meta, upload_table
 
         emb = self.embed_tokens
+        shard = emb.node_head_shard()
         weight, scales = emb._storage()
+        # Host rows start at the table's own first row (vocab_start_idx).
+        local = slice(
+            shard.vocab_start - emb.vocab_start_idx,
+            shard.vocab_end - emb.vocab_start_idx,
+        )
+        weight, scales = weight[local], scales[local]
         meta = gather_shard_meta(
-            int(emb.head_start),
-            int(emb.vocab_start_idx),
-            int(emb.vocab_end_idx),
-            int(weight.shape[0]),
+            shard.head_start, shard.vocab_start, shard.vocab_end, int(weight.shape[0])
         )
         rows = max(m[3] for m in meta)
         device = cast(torch.Tensor, self._staged_raw).device
@@ -1276,11 +1389,11 @@ class Engram(upstream.Engram):
         self._hbm_op = build_lookup_op(
             int(self.layer_hash_index),
             int(emb.n_hash_cols),
-            int(emb.part_n_hash_cols),
+            shard.part_cols,
             rows,
             int(self._host_raw.shape[-1]),
             int(emb.block_size),
-            int(emb.dp_size),
+            shard.node_size,
             meta,
         )
         logger.info(
@@ -1375,6 +1488,22 @@ class Engram(upstream.Engram):
         else:
             embedded = self.embed(hash_ids)
         kv = self.wkv(embedded.flatten(-2))
+        if (
+            envs.TPU_DEEPSEEK_V41_ENGRAM_PALLAS_GATE
+            and _GATE_OPS
+            and hidden_states.device.type == "tpu"
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape[0] > 0
+            and self.dim % 128 == 0
+        ):
+            # One pass over the flat streams instead of XLA's FP32 [T, M, D] passes.
+            args = (hidden_states.flatten(1), kv, self.q_weight, self.k_weight)
+            if token_mask is not None:
+                args += (token_mask,)
+            out = _GATE_OPS[token_mask is not None](
+                *args, float(self.eps), float(self.clamp_value)
+            )
+            return out.view_as(hidden_states)
         keys = (
             kv[:, : self.hc_mult * self.dim]
             .unflatten(-1, (self.hc_mult, self.dim))

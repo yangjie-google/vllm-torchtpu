@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
@@ -167,6 +167,8 @@ from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+
+    from vllm_torchtpu.distributed.host_allreduce import HostMaxAllReduce
 
 
 @dataclass
@@ -446,6 +448,9 @@ def _build_kv_connector_output(
 # Smallest output size
 MIN_NUM_SEQS = 8
 SAMPLING_EPS = 1e-5
+# (greedy, top_p) of the synthetic spec-decode warmup requests: one per
+# verify+sample program family (greedy, random, random with top-k/top-p).
+_SPEC_WARMUP_SAMPLING = ((True, 1.0), (False, 1.0), (False, 0.9))
 
 
 def _get_sequence_layout_planner_for_runner(runner: Any):
@@ -770,6 +775,9 @@ class TPUModelRunner(GPUModelRunner):
         # identical on every rank) and the dynamic expert re-layout
         # controller the worker arms after warm-up (expert_relayout.py).
         self._dp_step_index: int = 0
+        # Decided on the first step (_dp_step_max): the shared-memory reducer,
+        # or False to keep the gloo all-reduce.
+        self._dp_step_reduce: HostMaxAllReduce | Literal[False] | None = None
         self._expert_relayout: Any = None
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
@@ -1001,6 +1009,10 @@ class TPUModelRunner(GPUModelRunner):
         self._attention_kv_cache_group_id: int | None = None
         # Random host inputs for profile runs, one buffer per shape.
         self._profile_inputs: dict[str, torch.Tensor] = {}
+        # `_dummy_run` inputs of an idle DP rank, by (tokens, reqs, max-len):
+        # at most one per lockstep token bucket, each holding zeroed block
+        # tables of num_reqs_max_model_len rows for every KV group.
+        self._dp_idle_inputs: dict[tuple[int, int, bool], tuple] = {}
         # Per-key (trailing shape, dtype) of the tensors a stage receives.
         self._pp_intermediate_template: (
             dict[str, tuple[tuple[int, ...], torch.dtype]] | None
@@ -1011,9 +1023,24 @@ class TPUModelRunner(GPUModelRunner):
 
         # Tracks token padding in each step.
         self._token_padding_state: token_padding.TokenPaddingState | None = None
+        # Last padded sampling params per (rows, dtype): host copies and the
+        # device tensors uploaded from them (_build_padded_sampling_params).
+        self._padded_sampling_params: dict[
+            tuple[int, torch.dtype],
+            tuple[
+                tuple[torch.Tensor, ...],
+                tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None],
+            ],
+        ] = {}
 
         self._init_phased_profiling()
-        self._stage_timing = RunnerStageTiming(profiler_rank)
+        # The timings reach a metrics sink only through the KV connector's
+        # stats (get_finished_kv_transfers); without a connector they would be
+        # recorded on the serving thread every step and then discarded.
+        self._stage_timing = RunnerStageTiming(
+            profiler_rank,
+            enabled=self.vllm_config.kv_transfer_config is not None,
+        )
 
     def _init_num_reqs_caps(self) -> None:
         # Pallas SMEM-aware num_reqs caps. DeepSeek-V4.1 v2
@@ -3591,6 +3618,40 @@ class TPUModelRunner(GPUModelRunner):
                 return True
         return False
 
+    def _dp_step_max(
+        self, t: torch.Tensor, cpu_group: torch.distributed.ProcessGroup
+    ) -> torch.Tensor:
+        """Element-wise max of `t` over the DP group, once per step.
+
+        A one-host group reduces through shared memory: a gloo all-reduce over
+        8 ranks costs ~1 ms of loopback round trips on every rank's serving
+        thread, on the path to the step's first device program.
+        """
+        if self._dp_step_reduce is None:
+            from torch.distributed.constants import default_pg_timeout
+
+            from vllm_torchtpu.distributed import host_allreduce
+
+            use_shm = host_allreduce.usable(cpu_group)
+            self._dp_step_reduce = (
+                host_allreduce.HostMaxAllReduce(
+                    cpu_group, t.numel(), default_pg_timeout.total_seconds()
+                )
+                if use_shm
+                else False
+            )
+            logger.info_once(
+                "DP step metadata all-reduce over %d ranks: %s",
+                torch.distributed.get_world_size(cpu_group),
+                "shared memory" if use_shm else "gloo (ranks not on one x86 host)",
+            )
+        if self._dp_step_reduce is False:
+            torch.distributed.all_reduce(
+                t, op=torch.distributed.ReduceOp.MAX, group=cpu_group
+            )
+            return t
+        return self._dp_step_reduce(t)
+
     def _dp_coordinated_step(
         self,
         local_num_tokens: int,
@@ -3634,9 +3695,7 @@ class TPUModelRunner(GPUModelRunner):
             dtype=torch.int64,
             device="cpu",
         )
-        torch.distributed.all_reduce(
-            t, op=torch.distributed.ReduceOp.MAX, group=get_dp_group().cpu_group
-        )
+        t = self._dp_step_max(t, get_dp_group().cpu_group)
         self._dp_step_index += 1
         bucket = _get_padded_token_len(self.num_tokens_paddings, int(t[0].item()))
         if controller is not None:
@@ -4618,8 +4677,6 @@ class TPUModelRunner(GPUModelRunner):
             )
         assert accept_u is not None
         assert req_temperatures is not None
-        assert req_top_k is not None
-        assert req_top_p is not None
         recover_u = torch.rand_like(
             target_logits, dtype=torch.float32, generator=sampling_generator
         )
@@ -4643,8 +4700,8 @@ class TPUModelRunner(GPUModelRunner):
             group_indices=md.group_indices,
             max_draft_tokens=self.speculative_config.num_speculative_tokens,
             temperatures=req_temperatures[md.segment_ids],
-            top_k=req_top_k[md.segment_ids],
-            top_p=req_top_p[md.segment_ids],
+            top_k=None if req_top_k is None else req_top_k[md.segment_ids],
+            top_p=None if req_top_p is None else req_top_p[md.segment_ids],
             accept_u=accept_u,
             recover_u=recover_u,
             do_sampling=True,
@@ -5525,6 +5582,133 @@ class TPUModelRunner(GPUModelRunner):
         kv_cache_initialized = self.kv_cache_config is not None
         profiling = profile_prefix is not None
 
+        # An idle DP participant's padding forward reads the same inputs every
+        # step: build them, and stage their zeroed block tables, once per shape.
+        idle_key = (
+            (num_tokens, num_reqs, use_max_model_len)
+            if dp_lockstep and not profiling and kv_cache_initialized
+            else None
+        )
+        cached = self._dp_idle_inputs.get(idle_key) if idle_key else None
+        if cached is None:
+            built = self._dummy_run_inputs(
+                num_tokens,
+                num_reqs,
+                num_blocks,
+                use_max_model_len,
+                dp_lockstep,
+                profile_prefix,
+            )
+            if idle_key is not None:
+                self._dp_idle_inputs[idle_key] = built
+            input_ids, position_ids, per_layer_attn_metadata, _ = built
+        else:
+            (
+                input_ids,
+                position_ids,
+                per_layer_attn_metadata,
+                self._attn_metadata_builder_ctx,
+            ) = cached
+        inputs_embeds = None
+
+        padding_state = getattr(self, "_token_padding_state", None)
+        if padding_state is not None:
+            # Every row of a warmup step is padding; every row of a profile
+            # step is a real token.
+            padding_state.update(num_tokens if profiling else 0, num_tokens)
+        self._record_input_staging_fence()
+        intermediate_tensors = None
+        if through_handoff:
+            assert self._pp_wave is not None and not profiling
+            intermediate_tensors = self._pp_wave.start_forward(num_tokens)
+            self._pp_take_topk_indices(intermediate_tensors, num_tokens)
+        elif not self._pp_is_first:
+            intermediate_tensors = self._pp_intermediate_tensors(
+                num_tokens, zeros=not profiling, random=profiling
+            )
+            self._pp_take_topk_indices(intermediate_tensors, num_tokens)
+        with (
+            self.maybe_select_dummy_loras(
+                self.lora_config, np.array([num_tokens], dtype=np.int32)
+            ),
+            set_forward_context(
+                per_layer_attn_metadata,
+                self.vllm_config,
+                # Startup warmup has real padded model rows too. Passing zero
+                # makes DP metadata describe an empty batch, while model-local
+                # collectives (e.g. sharded embeddings) consume this bucket.
+                num_tokens=num_tokens if self._dp_lockstep_enabled() else 0,
+                num_tokens_across_dp=self._dp_num_tokens_across_dp(num_tokens),
+            ),
+            set_vllm_model_wrapper_context(
+                mesh=self.mesh,
+                vllm_config=self.vllm_config,
+                kv_cache_bundle=self._kv_cache_bundle,
+            ),
+        ):
+            if self.supports_mm_inputs and self._pp_is_first:
+                input_ids, inputs_embeds = self._get_model_inputs(input_ids, None)
+            if profiling:
+                # The inputs reach the device before the clock starts.
+                inputs = [t for t in (input_ids, inputs_embeds) if t is not None]
+                if intermediate_tensors is not None:
+                    inputs += list(intermediate_tensors.tensors.values())
+                if self._pp_topk_buffer is not None:
+                    inputs.append(self._pp_topk_buffer)
+                synchronize_tensors(inputs)
+            started = time.perf_counter()
+            out, _ = self.forward_model(
+                input_ids=input_ids,
+                positions=position_ids,
+                inputs_embeds=inputs_embeds,
+                intermediate_tensors=intermediate_tensors,
+            )
+            if isinstance(out, IntermediateTensors):
+                if through_handoff:
+                    # The output leaves padded to the hand-off buffer; it is
+                    # submitted without waiting, as between serving steps.
+                    self._pp_wave.end_forward(
+                        self._pp_outgoing_tensors(out.tensors, num_tokens), num_tokens
+                    )
+                    synchronize_tensors(None, wait=False)
+                    return None
+                # A stage before the last produces no logits; nothing
+                # consumes its output in a warmup.
+                synchronize_tensors(list(out.tensors.values()))
+                return (time.perf_counter() - started) * 1000.0 if profiling else None
+            if through_handoff:
+                self._pp_wave.end_forward(None, num_tokens)
+            if dp_lockstep:
+                # Idle DP engines must issue the same TP logits collective as
+                # busy engines before the next DP synchronization.
+                _idx = torch.zeros(num_reqs, dtype=torch.int32, device=out.device)
+                _ = self.compute_selected_logits(out, _idx)
+            if not dp_lockstep:
+                synchronize_tensors(out)
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self._hidden_states_dtype = out.dtype
+        return elapsed_ms if profiling else None
+
+    def _dummy_run_inputs(
+        self,
+        num_tokens: int,
+        num_reqs: int,
+        num_blocks: int,
+        use_max_model_len: bool,
+        dp_lockstep: bool,
+        profile_prefix: int | None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        dict[str, AttentionMetadata],
+        AttentionMetadataBuilderContext | None,
+    ]:
+        """Token ids, positions, per-layer attention metadata and the builder
+        context (installed on the runner; None before the KV cache exists) of
+        one `_dummy_run` batch."""
+        kv_cache_initialized = self.kv_cache_config is not None
+        profiling = profile_prefix is not None
+
         # A profile batch carries random values so every token row routes
         # on its own, as real tokens do; a warmup batch traces shapes only.
         profile_query_lens: list[int] = []
@@ -5648,6 +5832,7 @@ class TPUModelRunner(GPUModelRunner):
                     slot_mappings=slot_mappings,
                 )
             )
+            ctx = self._attn_metadata_builder_ctx
         else:
             # Pre-init path (called before initialize_kv_cache): use the
             # caller-supplied num_blocks and a single shared metadata.
@@ -5674,84 +5859,8 @@ class TPUModelRunner(GPUModelRunner):
             per_layer_attn_metadata = {
                 layer_name: attn_metadata for layer_name in self._attn_layer_names
             }
-
-        padding_state = getattr(self, "_token_padding_state", None)
-        if padding_state is not None:
-            # Every row of a warmup step is padding; every row of a profile
-            # step is a real token.
-            padding_state.update(num_tokens if profiling else 0, num_tokens)
-        self._record_input_staging_fence()
-        intermediate_tensors = None
-        if through_handoff:
-            assert self._pp_wave is not None and not profiling
-            intermediate_tensors = self._pp_wave.start_forward(num_tokens)
-            self._pp_take_topk_indices(intermediate_tensors, num_tokens)
-        elif not self._pp_is_first:
-            intermediate_tensors = self._pp_intermediate_tensors(
-                num_tokens, zeros=not profiling, random=profiling
-            )
-            self._pp_take_topk_indices(intermediate_tensors, num_tokens)
-        with (
-            self.maybe_select_dummy_loras(
-                self.lora_config, np.array([num_tokens], dtype=np.int32)
-            ),
-            set_forward_context(
-                per_layer_attn_metadata,
-                self.vllm_config,
-                # Startup warmup has real padded model rows too. Passing zero
-                # makes DP metadata describe an empty batch, while model-local
-                # collectives (e.g. sharded embeddings) consume this bucket.
-                num_tokens=num_tokens if self._dp_lockstep_enabled() else 0,
-                num_tokens_across_dp=self._dp_num_tokens_across_dp(num_tokens),
-            ),
-            set_vllm_model_wrapper_context(
-                mesh=self.mesh,
-                vllm_config=self.vllm_config,
-                kv_cache_bundle=self._kv_cache_bundle,
-            ),
-        ):
-            if self.supports_mm_inputs and self._pp_is_first:
-                input_ids, inputs_embeds = self._get_model_inputs(input_ids, None)
-            if profiling:
-                # The inputs reach the device before the clock starts.
-                inputs = [t for t in (input_ids, inputs_embeds) if t is not None]
-                if intermediate_tensors is not None:
-                    inputs += list(intermediate_tensors.tensors.values())
-                if self._pp_topk_buffer is not None:
-                    inputs.append(self._pp_topk_buffer)
-                synchronize_tensors(inputs)
-            started = time.perf_counter()
-            out, _ = self.forward_model(
-                input_ids=input_ids,
-                positions=position_ids,
-                inputs_embeds=inputs_embeds,
-                intermediate_tensors=intermediate_tensors,
-            )
-            if isinstance(out, IntermediateTensors):
-                if through_handoff:
-                    # The output leaves padded to the hand-off buffer; it is
-                    # submitted without waiting, as between serving steps.
-                    self._pp_wave.end_forward(
-                        self._pp_outgoing_tensors(out.tensors, num_tokens), num_tokens
-                    )
-                    synchronize_tensors(None, wait=False)
-                    return None
-                # A stage before the last produces no logits; nothing
-                # consumes its output in a warmup.
-                synchronize_tensors(list(out.tensors.values()))
-                return (time.perf_counter() - started) * 1000.0 if profiling else None
-            if through_handoff:
-                self._pp_wave.end_forward(None, num_tokens)
-            if dp_lockstep:
-                # Idle DP engines must issue the same TP logits collective as
-                # busy engines before the next DP synchronization.
-                _idx = torch.zeros(num_reqs, dtype=torch.int32, device=out.device)
-                _ = self.compute_selected_logits(out, _idx)
-            if not dp_lockstep:
-                synchronize_tensors(out)
-            elapsed_ms = (time.perf_counter() - started) * 1000.0
-        self._hidden_states_dtype = out.dtype
-        return elapsed_ms if profiling else None
+            ctx = None
+        return input_ids, position_ids, per_layer_attn_metadata, ctx
 
     def _profile_input(
         self, name: str, shape: tuple[int, ...], dtype: torch.dtype
@@ -6123,13 +6232,19 @@ class TPUModelRunner(GPUModelRunner):
                 dummy_top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(
                     self.device
                 )
-                for all_greedy in [False, True]:
+                # Non-greedy with and without top-k/top-p filtering
+                # (_build_padded_sampling_params), then greedy.
+                for top_k, top_p, all_greedy in [
+                    (dummy_top_k, dummy_top_p, False),
+                    (None, None, False),
+                    (dummy_top_k, dummy_top_p, True),
+                ]:
                     out = self.sample_from_logits_func(
                         dummy_logits,
                         dummy_temperatures,
                         dummy_u,
-                        dummy_top_k,
-                        dummy_top_p,
+                        top_k,
+                        top_p,
                         all_greedy=all_greedy,
                     )
                     synchronize_tensors(out)
@@ -6407,22 +6522,25 @@ class TPUModelRunner(GPUModelRunner):
                         num_tokens,
                         num_reqs,
                     )
-                    out = self.rejection_sampler(
-                        draft_token_ids=draft_token_ids,
-                        num_draft_tokens=draft_lengths,
-                        target_logits=target_logits_ng,
-                        bonus_token_ids=bonus_token_ids,
-                        segment_ids=segment_ids,
-                        group_indices=group_indices,
-                        max_draft_tokens=k,
-                        temperatures=warm_temps,
-                        top_k=warm_top_k,
-                        top_p=warm_top_p,
-                        accept_u=warm_accept_u,
-                        recover_u=warm_recover_u,
-                        do_sampling=True,
-                    )
-                    synchronize_tensors(out)
+                    # With and without top-k/top-p filtering
+                    # (_build_padded_sampling_params).
+                    for top_k, top_p in [(warm_top_k, warm_top_p), (None, None)]:
+                        out = self.rejection_sampler(
+                            draft_token_ids=draft_token_ids,
+                            num_draft_tokens=draft_lengths,
+                            target_logits=target_logits_ng,
+                            bonus_token_ids=bonus_token_ids,
+                            segment_ids=segment_ids,
+                            group_indices=group_indices,
+                            max_draft_tokens=k,
+                            temperatures=warm_temps,
+                            top_k=top_k,
+                            top_p=top_p,
+                            accept_u=warm_accept_u,
+                            recover_u=warm_recover_u,
+                            do_sampling=True,
+                        )
+                        synchronize_tensors(out)
                     if getattr(self.drafter, "sampled_draft", False):
                         logger.info(
                             "Rejection warmup: stage=random_sampled_draft rows=%d reqs=%d",
@@ -6830,11 +6948,12 @@ class TPUModelRunner(GPUModelRunner):
                 # max_model_len, e.g. small max_model_len configs.
                 if int(P) > self.max_model_len:
                     continue
-                # Greedy and non-greedy (do_sampling=True) verify+sample are
-                # DISTINCT fused programs, so sweep both at every prompt bucket.
-                for greedy in (True, False):
+                # Greedy, non-greedy (do_sampling=True) and top-p filtered
+                # verify+sample are DISTINCT fused programs, so sweep each at
+                # every prompt bucket.
+                for greedy, top_p in _SPEC_WARMUP_SAMPLING:
                     if not self._warmup_one_spec_request(
-                        int(P), idx=i, quiet=True, greedy=greedy
+                        int(P), idx=i, quiet=True, greedy=greedy, top_p=top_p
                     ):
                         # First attempt cold-compiles the draft forward; a
                         # SymInt from that cold compile can leak into the
@@ -6842,7 +6961,9 @@ class TPUModelRunner(GPUModelRunner):
                         # once now that the forward is compiled and returns
                         # concrete-shaped tensors (this attempt logs loudly if it
                         # also fails).
-                        self._warmup_one_spec_request(int(P), idx=i, greedy=greedy)
+                        self._warmup_one_spec_request(
+                            int(P), idx=i, greedy=greedy, top_p=top_p
+                        )
             # (2) Batched spec steps. A bucketed-draft proposer depends on no
             # exact request count, so one count per program-bucket combination
             # (`_spec_warmup_bucket_grid`), each with a short decode run and a
@@ -6859,18 +6980,23 @@ class TPUModelRunner(GPUModelRunner):
                     sweep,
                 )
                 for R in sweep:
-                    self._warmup_spec_batch(
-                        int(R), P_small, greedy=True, short=True, mixed=True
-                    )
-                    self._warmup_spec_batch(
-                        int(R), P_small, greedy=False, short=True, mixed=True
-                    )
+                    for greedy, top_p in _SPEC_WARMUP_SAMPLING:
+                        self._warmup_spec_batch(
+                            int(R),
+                            P_small,
+                            greedy=greedy,
+                            top_p=top_p,
+                            short=True,
+                            mixed=True,
+                        )
             elif self.scheduler_config.max_num_seqs > 1:
                 P_small = int(self.num_tokens_paddings[0])
                 for R in self.num_reqs_paddings:
                     if int(R) > 1:
-                        self._warmup_spec_batch(int(R), P_small, greedy=True)
-                        self._warmup_spec_batch(int(R), P_small, greedy=False)
+                        for greedy, top_p in _SPEC_WARMUP_SAMPLING:
+                            self._warmup_spec_batch(
+                                int(R), P_small, greedy=greedy, top_p=top_p
+                            )
         logger.info("spec-decode warmup compiled %d graphs", self.num_xla_graphs - n0)
 
     def _spec_warmup_bucket_grid(self, mixed: bool) -> list[int]:
@@ -6924,6 +7050,7 @@ class TPUModelRunner(GPUModelRunner):
         P: int,
         greedy: bool = True,
         *,
+        top_p: float = 1.0,
         short: bool = False,
         mixed: bool = False,
     ) -> None:
@@ -6931,7 +7058,8 @@ class TPUModelRunner(GPUModelRunner):
         them together so the multi-request fused programs are compiled.
 
         greedy=False routes the non-greedy (do_sampling=True) verify+sample
-        fusion, which is a distinct set of programs from the greedy path."""
+        fusion, which is a distinct set of programs from the greedy path, and
+        top_p < 1 its top-k/top-p filtering variant."""
         from vllm.sampling_params import SamplingParams
         from vllm.v1.core.sched.output import (
             CachedRequestData,
@@ -6943,8 +7071,14 @@ class TPUModelRunner(GPUModelRunner):
         assert self.kv_cache_config is not None
         K = self.speculative_config.num_speculative_tokens
         room = self.max_model_len - P
-        n_decode = min(3 if short else max(5, K + 2), max(0, room // (1 + K) - 1))
-        max_pos = min(self.max_model_len, P + n_decode * (1 + K))
+        steps = max(0, room // (1 + K) - 1)
+        n_decode = min(3 if short else max(5, K + 2), steps)
+        # The mixed steps below advance the decode requests too: at most two
+        # budget-filling steps and one per smaller token bucket.
+        n_mixed = (
+            min(2 + len(self.num_tokens_paddings), steps - n_decode) if mixed else 0
+        )
+        max_pos = min(self.max_model_len, P + (n_decode + n_mixed) * (1 + K))
         # Per-group block counts at each group's own block size (see
         # _warmup_one_spec_request); the per-request stride uses the widest
         # group so every group's ranges stay disjoint across requests.
@@ -6960,8 +7094,14 @@ class TPUModelRunner(GPUModelRunner):
         rids = [f"__spec_warmup_b{R}_{j}__" for j in range(R)]
         mix_rid = f"__spec_warmup_b{R}_mix"
         mix_ids: list[str] = []
-        sp = SamplingParams(temperature=0.0 if greedy else 1.0)
-        logger.info("spec-decode warmup batch: R=%d P=%d greedy=%s", R, P, greedy)
+        sp = SamplingParams(temperature=0.0 if greedy else 1.0, top_p=top_p)
+        logger.info(
+            "spec-decode warmup batch: R=%d P=%d greedy=%s top_p=%s",
+            R,
+            P,
+            greedy,
+            top_p,
+        )
         try:
             # Match the low-block working set used by the LIFO BlockPool
             # workaround. High physical block ids can trigger the v7x SC2
@@ -7041,10 +7181,19 @@ class TPUModelRunner(GPUModelRunner):
                 variants = [[P_mix]]
                 if self.max_num_reqs >= R + 2 and P_mix >= 2 * P:
                     variants.append([P_mix // 2, P_mix - P_mix // 2])
+                # A prompt's last chunk shorter than the budget puts the step
+                # in a smaller token bucket, whose programs serving would
+                # otherwise compile on first use: one prefill filling each.
+                variants += [
+                    [int(b) - R * (1 + K)]
+                    for b in self.num_tokens_paddings
+                    if P <= int(b) - R * (1 + K) < P_mix
+                ]
+                variants = variants[:n_mixed]
                 prev_ids: list[str] = []
                 base_lo = 1 + R * nblk
                 for vi, plist in enumerate(variants):
-                    if top <= base_lo + (vi + 1) * len(plist) * mix_nblk + 1:
+                    if top <= base_lo + (vi * 2 + len(plist)) * mix_nblk + 1:
                         break
                     extras = []
                     for k_, Pk in enumerate(plist):
@@ -7096,7 +7245,12 @@ class TPUModelRunner(GPUModelRunner):
             self._warmup_spec_decode_cleanup(rids + mix_ids)
 
     def _warmup_one_spec_request(
-        self, P: int, idx: int, quiet: bool = False, greedy: bool = True
+        self,
+        P: int,
+        idx: int,
+        quiet: bool = False,
+        greedy: bool = True,
+        top_p: float = 1.0,
     ) -> bool:
         """Run one synthetic spec-decode request (prefill P + decodes).
 
@@ -7146,7 +7300,7 @@ class TPUModelRunner(GPUModelRunner):
             logger.warning("skip spec-decode warmup P=%d: not enough kv blocks", P)
             return False
         block_ids = tuple(block_ids_per_group)
-        sp = SamplingParams(temperature=0.0 if greedy else 1.0)
+        sp = SamplingParams(temperature=0.0 if greedy else 1.0, top_p=top_p)
         try:
             # ---- prefill ----
             new_req = NewRequestData(
@@ -7581,7 +7735,7 @@ class TPUModelRunner(GPUModelRunner):
         cur_start_idx: int,
         cur_end_idx: int,
         logits: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         # Stage [padded_num_reqs] on CPU with neutral padding, then use one
         # fixed-shape H2D copy per tensor to keep decode shape-stable.
         padded_num_reqs = logits.shape[0]
@@ -7605,11 +7759,24 @@ class TPUModelRunner(GPUModelRunner):
             self.input_batch.top_p_cpu_tensor[cur_start_idx:cur_end_idx]
         )
 
-        return (
-            temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_k_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-        )
+        # A batch keeps its sampling params from step to step: reuse the last
+        # upload when the padded rows are unchanged (the consumers only read).
+        host = (temps_cpu, top_k_cpu, top_p_cpu)
+        key = (padded_num_reqs, logits.dtype)
+        cached = self._padded_sampling_params.get(key)
+        if cached is not None and all(map(torch.equal, cached[0], host)):
+            return cached[1]
+        temps = temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True)
+        # No row filters: None lets the samplers skip both full-vocab searches.
+        # One decision for both keeps two compiled variants per bucket.
+        top_k = top_p = None
+        if (top_k_cpu > 0).any() or (top_p_cpu < 1.0).any():
+            top_k, top_p = (
+                t.unsqueeze(1).to(logits.device, non_blocking=True)
+                for t in (top_k_cpu, top_p_cpu)
+            )
+        self._padded_sampling_params[key] = (host, (temps, top_k, top_p))
+        return temps, top_k, top_p
 
     def _init_fused_greedy_head(self) -> None:
         self._fused_greedy_head: FusedGreedyHead | None = None
@@ -7753,8 +7920,8 @@ class TPUModelRunner(GPUModelRunner):
         logits: torch.Tensor,
         temperatures: torch.Tensor,
         u: torch.Tensor,
-        top_k: torch.Tensor,
-        top_p: torch.Tensor,
+        top_k: torch.Tensor | None,
+        top_p: torch.Tensor | None,
         all_greedy: bool = False,
     ) -> torch.Tensor:
         """

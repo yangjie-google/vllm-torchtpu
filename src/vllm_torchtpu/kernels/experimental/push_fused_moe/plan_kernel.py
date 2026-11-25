@@ -30,7 +30,12 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.push_fused_moe import tc_exchange as tx
-from vllm_torchtpu.kernels.fused_moe.v2.host import ROWBLK, ROWBLK_SHIFT, pow2_shift
+from vllm_torchtpu.kernels.fused_moe.v2.host import (
+    ROWBLK,
+    ROWBLK_SHIFT,
+    off_shard_slab_row,
+    pow2_shift,
+)
 
 LANES = 128
 
@@ -106,12 +111,29 @@ def _tables(r3, seg3, me, *, ep, g, n_pre, tile_m, light_prepush=0):
     local_base = _lane_excl_cumsum(ea)
 
     # Visit lists: experts with rows, most rows first, ties by index
-    # (v2's expert_visit_list key, ranked by compare).
-    key = jnp.where(real, lane - ea * g, i32(2**30))
-    rank = zero
+    # (v2's expert_visit_list key, ranked by compare). From here on the
+    # visit tables are worked in the [e or v, d] layout they are stored in
+    # (experts, then visits, on sublanes): rank is a permutation of [0, g)
+    # over each destination's experts, so expert e of destination d lands on
+    # sublane rank[d, e] by selects alone (gathering per visit instead costs
+    # a cross-lane reduction per visit and table).
+    gr = -(-g // 8) * 8
+    sub = lax.broadcasted_iota(i32, (gr, LANES), 0)
+    col = lax.broadcasted_iota(i32, (gr, LANES), 1)  # destination d
+
+    def to_t(x):
+        return _transpose(x)[:gr]
+
+    def row_of(x, e):
+        return jnp.broadcast_to(x[e : e + 1], (gr, LANES))
+
+    ea_t = to_t(ea)
+    real_t = (sub < g) & (col < ep)
+    key = jnp.where(real_t, sub - ea_t * g, i32(2**30))
+    rank = jnp.zeros((gr, LANES), i32)
     for e in range(g):
-        rank = rank + (key[:, e : e + 1] < key).astype(i32)
-    n_visit = jnp.sum((real & (ea > 0)).astype(i32), 1, keepdims=True)  # [d, 1]
+        rank = rank + (row_of(key, e) < key).astype(i32)
+    n_visit = jnp.sum((real_t & (ea_t > 0)).astype(i32), 0, keepdims=True)  # [1, d]
     if light_prepush:
         # The SparseCore pre-push carries the n_pre LIGHTEST experts with
         # rows (lightest at 0), so it moves the fewest bytes. The rest follow
@@ -134,49 +156,38 @@ def _tables(r3, seg3, me, *, ep, g, n_pre, tile_m, light_prepush=0):
         rank = jnp.where(
             light, n_visit - 1 - rank, jnp.where(rank < m, rest + n_lp, rank)
         )
-    visit = zero
-    for v in range(g):
-        col = jnp.sum(_sel(real & (rank == v), lane), 1, keepdims=True)
-        visit = jnp.where(lane == v, jnp.minimum(col, g - 1), visit)
-    live = real & (lane < n_visit)
-
-    def by_visit(tbl):
-        out = zero
-        for v in range(g):
-            hit = (lane == visit[:, v : v + 1]) & real
-            col = jnp.sum(_sel(hit, tbl), 1, keepdims=True)
-            out = jnp.where(lane == v, col, out)
-        return _sel(live, out)  # [d, v]
-
-    cnt = by_visit(mine)
-    src_off = by_visit(seg3)
-    dst_row = by_visit(local_base + run_me)
-    seg_a = (row << 24) | (visit << 16) | cnt
-    seg_a = jnp.where(real, seg_a, 0)
-    seg_c = _sel(cnt > 0, dst_row)
+    tables = [to_t(x) for x in (mine, seg3, local_base + run_me)]
+    visit_t = jnp.zeros((gr, LANES), i32)
+    got = [visit_t] * len(tables)
+    for e in range(g):
+        hit = sub == row_of(rank, e)
+        visit_t = jnp.where(hit, e, visit_t)
+        got = [jnp.where(hit, row_of(x, e), o) for x, o in zip(tables, got)]
+    live_t = (sub < n_visit) & (col < ep)  # [v, d]
+    cnt_t, src_off_t, dst_t = (_sel(live_t, x) for x in got)
+    seg_a_t = jnp.where(sub < g, (col << 24) | (visit_t << 16) | cnt_t, 0)
+    seg_c_t = _sel(cnt_t > 0, dst_t)
     recv = jnp.sum(r_dme, 0, keepdims=True)  # [1, e]
-    remote = _sel(row != me, cnt)
-    my_visit = jnp.sum(_sel(row == me, visit), 0, keepdims=True)  # [1, v]
-    me_live = jnp.sum(_sel(row == me, live.astype(i32)), 0, keepdims=True) > 0
+    my_visit = jnp.sum(_sel(row == me, _transpose(visit_t)[:ep]), 0, keepdims=True)
     lane1 = lane[:1]
-    rows_at_v = jnp.zeros((1, LANES), i32)
-    for v in range(g):
-        hit = lane1 == my_visit[:, v : v + 1]
-        val = jnp.sum(_sel(hit, recv), 1, keepdims=True)
-        rows_at_v = jnp.where(lane1 == v, val, rows_at_v)
-    rows_at_v = _sel(me_live, rows_at_v)
-    remote_v = jnp.sum(remote, 0, keepdims=True)  # [1, v]
-    pre = lane1 < n_pre
-    odd = (lane1 & 1) == 1
     real1 = lane1 < g
+    # rows_at_v (rows this shard receives at its visit v), summed over the
+    # pre-push positions straight from the expert layout: column me of rank
+    # is my visit of each expert.
+    recv_t = jnp.sum(to_t(r_dme), 1, keepdims=True)  # [e, 1]
+    at_me = (col == me) & (sub < g) & (rank < n_visit)
+    pre_e = at_me & (rank < n_pre)
+    odd_e = (rank & 1) == 1
+    pre_v = (col != me) & (sub < n_pre)
+    odd_v = (sub & 1) == 1
     sc = [
-        jnp.sum(_sel(pre & ~odd & real1, rows_at_v)),
-        jnp.sum(_sel(pre & odd & real1, rows_at_v)),
-        jnp.sum(_sel(pre & ~odd & real1, remote_v)),
-        jnp.sum(_sel(pre & odd & real1, remote_v)),
+        jnp.sum(_sel(pre_e & ~odd_e, recv_t)),
+        jnp.sum(_sel(pre_e & odd_e, recv_t)),
+        jnp.sum(_sel(pre_v & ~odd_v, cnt_t)),
+        jnp.sum(_sel(pre_v & odd_v, cnt_t)),
     ]
-    n_remote = jnp.sum(_sel((lane1 >= n_pre) & real1, remote_v))
-    n_sent = jnp.sum(cnt)
+    n_remote = jnp.sum(_sel((col != me) & (sub >= n_pre), cnt_t))
+    n_sent = jnp.sum(cnt_t)
     vec = jnp.zeros((1, LANES), i32)
     for j, val in enumerate(sc):
         vec = jnp.where(lane1 == j, val, vec)
@@ -260,7 +271,7 @@ def _tables(r3, seg3, me, *, ep, g, n_pre, tile_m, light_prepush=0):
     run_base = run_start_se + slab_base
 
     return dict(
-        seg=(_transpose(seg_a), _transpose(src_off), _transpose(seg_c)),
+        seg=(seg_a_t, src_off_t, seg_c_t),
         small=(meta, my_visit, counts_sc, expert_rows, slab_base),
         kernel_tables=(
             run_start_t >> ROWBLK_SHIFT,
@@ -407,6 +418,68 @@ def _relane_counts(cnt, r3_ref, *, count_at, g):
         r3_ref[:, d, :] = jnp.where(lane < g, lo, 0)
 
 
+def _count_rows(count_at, ep, g):
+    """(first row, rows) of the payload slab holding the e_total count words."""
+    r_lo = count_at // LANES
+    return r_lo, (count_at + ep * g - 1) // LANES - r_lo + 1
+
+
+def _exchange_name(
+    ep, width, n_rows, light_prepush, single_barrier, part="", scatter_rows=False
+):
+    return (
+        f"moe_tc_routing_exchange_ep{ep}_w{width}_rows{n_rows}_tables"
+        + (f"_lp{light_prepush}" if light_prepush else "")
+        + part
+        + ("_1b" if single_barrier else "")
+        + ("_rowmap" if scatter_rows else "")
+    )
+
+
+def _issue_row_copies(src_hbm, dst_hbm, idx_sm, gsem, n_rows, scatter=False):
+    """dst[j] = src[idx[j]], one local DMA per row, left in flight on gsem;
+    `scatter`: dst[idx[j] & 0xFFFF] = src[idx[j] >> 16] (build_local_ranks'
+    row map), the same copies issued in pair order."""
+
+    def one(j, c):
+        if scatter:
+            src, dst = idx_sm[j] >> 16, idx_sm[j] & 0xFFFF
+        else:
+            src, dst = idx_sm[j], j
+        pltpu.make_async_copy(
+            src_hbm.at[pl.ds(src, 1)], dst_hbm.at[pl.ds(dst, 1)], gsem
+        ).start()
+        return c
+
+    lax.fori_loop(0, n_rows, one, jnp.int32(0), unroll=8)
+
+
+def _tables_after_exchange(
+    me, out_hbm, dst_hbm, seg3_vm, outs, csem, gsem, cnt_vm, r3_vm, *, g, **kw
+):
+    """Every peer's row has landed in out_hbm; the row copies may still be in
+    flight, and the tables are built meanwhile from the exchanged counts.
+    `kw`: count_at and _tables' ep, n_pre, tile_m, light_prepush."""
+    count_at = kw.pop("count_at")
+    r_lo, n_cnt = _count_rows(count_at, kw["ep"], g)
+    cp = pltpu.make_async_copy(out_hbm.at[:, pl.ds(r_lo, n_cnt), :], cnt_vm, csem)
+    cp.start()
+    cp.wait()
+    _relane_counts(cnt_vm[...], r3_vm, count_at=count_at - r_lo * LANES, g=g)
+    _store_tables(
+        _tables(r3_vm[...], seg3_vm[...], me, g=g, **kw), outs, ep=kw["ep"], g=g
+    )
+    pltpu.make_async_copy(dst_hbm, dst_hbm, gsem).wait()
+
+
+def _table_scratch(ep, n_cnt):
+    """The count words and their re-laned [s, d, 128] form."""
+    return (
+        pltpu.VMEM((ep, n_cnt, LANES), jnp.int32),
+        pltpu.VMEM((ep, ep, LANES), jnp.int32),
+    )
+
+
 @functools.cache
 def _build_exchange_rows_tables(
     ep,
@@ -418,26 +491,23 @@ def _build_exchange_rows_tables(
     tile_m,
     light_prepush=0,
     single_barrier=False,
+    scatter_rows=False,
 ):
     slab_rows = tx._slab_rows(width)
-    r_lo = count_at // LANES
-    r_hi = (count_at + ep * g - 1) // LANES
-    n_cnt = r_hi - r_lo + 1
+    n_cnt = _count_rows(count_at, ep, g)[1]
+    table_kw = dict(
+        g=g,
+        count_at=count_at,
+        ep=ep,
+        n_pre=n_pre,
+        tile_m=tile_m,
+        light_prepush=light_prepush,
+    )
 
     def kernel(rank_sm, idx_sm, x_hbm, src_hbm, seg3_vm, out_hbm, dst_hbm, *rest):
         outs = rest[:N_TABLE_OUTS]
         send_sem, recv_sem, lsem, gsem, csem, cnt_vm, r3_vm = rest[N_TABLE_OUTS:]
         me = rank_sm[0]
-
-        def copy_rows():
-            def one(j, c):
-                pltpu.make_async_copy(
-                    src_hbm.at[pl.ds(idx_sm[j], 1)], dst_hbm.at[pl.ds(j, 1)], gsem
-                ).start()
-                return c
-
-            lax.fori_loop(0, n_rows, one, jnp.int32(0), unroll=8)
-
         tx._exchange(
             ep,
             me,
@@ -446,27 +516,14 @@ def _build_exchange_rows_tables(
             send_sem,
             recv_sem,
             lsem,
-            copy_rows,
+            lambda: _issue_row_copies(
+                src_hbm, dst_hbm, idx_sm, gsem, n_rows, scatter_rows
+            ),
             single_barrier=single_barrier,
         )
-        # Every peer's row has landed; the row copies may still be in flight,
-        # and the tables are built meanwhile from the exchanged counts.
-        cp = pltpu.make_async_copy(out_hbm.at[:, pl.ds(r_lo, n_cnt), :], cnt_vm, csem)
-        cp.start()
-        cp.wait()
-        _relane_counts(cnt_vm[...], r3_vm, count_at=count_at - r_lo * LANES, g=g)
-        t = _tables(
-            r3_vm[...],
-            seg3_vm[...],
-            me,
-            ep=ep,
-            g=g,
-            n_pre=n_pre,
-            tile_m=tile_m,
-            light_prepush=light_prepush,
+        _tables_after_exchange(
+            me, out_hbm, dst_hbm, seg3_vm, outs, csem, gsem, cnt_vm, r3_vm, **table_kw
         )
-        _store_tables(t, outs, ep=ep, g=g)
-        pltpu.make_async_copy(dst_hbm, dst_hbm, gsem).wait()
 
     def fn(packed, rank, rows, idx, seg_start_local):
         idx = idx.astype(jnp.int32).reshape(-1)
@@ -479,10 +536,7 @@ def _build_exchange_rows_tables(
                 in_specs=[tx._HBM, tx._HBM, vmem],
                 out_specs=(tx._HBM, tx._HBM) + (vmem,) * N_TABLE_OUTS,
                 scratch_shapes=(pltpu.SemaphoreType.DMA,) * 5
-                + (
-                    pltpu.VMEM((ep, n_cnt, LANES), jnp.int32),
-                    pltpu.VMEM((ep, ep, LANES), jnp.int32),
-                ),
+                + _table_scratch(ep, n_cnt),
                 grid=(),
             ),
             out_shape=(
@@ -491,11 +545,17 @@ def _build_exchange_rows_tables(
             )
             + _table_out_shapes(ep, g),
             compiler_params=tx._compiler_params(),
-            name=f"moe_tc_routing_exchange_ep{ep}_w{width}_rows{n_rows}_tables"
-            + (f"_lp{light_prepush}" if light_prepush else "")
-            + ("_1b" if single_barrier else ""),
+            name=_exchange_name(
+                ep,
+                width,
+                n_rows,
+                light_prepush,
+                single_barrier,
+                scatter_rows=scatter_rows,
+            ),
         )(r, idx, slab, rows, _seg3(seg_start_local, ep, g))
-        return (tx._unpad(out, ep, width), gathered) + _unpack_tables(tables)
+        # The raw [ep, rows, 128] payload last, for build_pair_tables.
+        return (tx._unpad(out, ep, width), gathered) + _unpack_tables(tables) + (out,)
 
     return fn
 
@@ -511,12 +571,14 @@ def build_exchange_rows_tables(
     tile_m,
     light_prepush=0,
     single_barrier=False,
+    scatter_rows=False,
 ):
     """tc_exchange.build_tc_exchange_all_gather_rows' kernel that also builds
     build_push_tables' tables from the exchanged counts (words
     [count_at, count_at + e_total) of every rank's payload), while its row
     copies finish. fn(packed, rank, rows, idx, seg_start_local) ->
-    (exchange, rows[idx], *build_push_tables(...))."""
+    (exchange, rows[idx], *build_push_tables(...)); with `scatter_rows`, idx
+    is build_local_ranks' row map and the rows are the ones it maps."""
     g = e_total // ep
     if g > LANES or ep > LANES or 2 * g + 3 > LANES:
         raise ValueError(f"the table kernel takes g_local, ep <= {LANES}")
@@ -530,4 +592,596 @@ def build_exchange_rows_tables(
         int(tile_m),
         int(light_prepush),
         bool(single_barrier),
+        bool(scatter_rows),
     )
+
+
+_SEM = pl.BlockSpec(memory_space=pltpu.MemorySpace.SEMAPHORE)
+# The split kernels' DMA semaphores: send, recv, local row, row copies.
+_N_SPLIT_SEMS = 4
+
+
+@functools.cache
+def _build_exchange_rows_tables_split(
+    ep,
+    width,
+    n_rows,
+    count_at,
+    g,
+    n_pre,
+    tile_m,
+    light_prepush=0,
+    single_barrier=False,
+    scatter_rows=False,
+):
+    slab_rows = tx._slab_rows(width)
+    n_cnt = _count_rows(count_at, ep, g)[1]
+    table_kw = dict(
+        g=g,
+        count_at=count_at,
+        ep=ep,
+        n_pre=n_pre,
+        tile_m=tile_m,
+        light_prepush=light_prepush,
+    )
+
+    def start_kernel(rank_sm, idx_sm, x_hbm, src_hbm, out_hbm, dst_hbm, sems):
+        send_sem, recv_sem, lsem, gsem = (sems.at[i] for i in range(_N_SPLIT_SEMS))
+        tx._exchange_start(
+            ep,
+            rank_sm[0],
+            x_hbm,
+            out_hbm,
+            send_sem,
+            recv_sem,
+            lsem,
+            lambda: _issue_row_copies(
+                src_hbm, dst_hbm, idx_sm, gsem, n_rows, scatter_rows
+            ),
+            single_barrier=single_barrier,
+        )
+
+    def done_kernel(rank_sm, x_hbm, src_hbm, out_in, dst_in, sems, seg3_vm, *rest):
+        # src_hbm is only kept live for the row copies still reading it;
+        # out_in and dst_in are out_hbm and dst_hbm (aliased).
+        del src_hbm, out_in, dst_in
+        out_hbm, dst_hbm = rest[:2]
+        outs = rest[2 : 2 + N_TABLE_OUTS]
+        csem, cnt_vm, r3_vm = rest[2 + N_TABLE_OUTS :]
+        send_sem, recv_sem, lsem, gsem = (sems.at[i] for i in range(_N_SPLIT_SEMS))
+        me = rank_sm[0]
+        tx._exchange_wait(ep, me, x_hbm, out_hbm, send_sem, recv_sem, lsem)
+        _tables_after_exchange(
+            me, out_hbm, dst_hbm, seg3_vm, outs, csem, gsem, cnt_vm, r3_vm, **table_kw
+        )
+
+    def start(packed, rank, rows, idx):
+        idx = idx.astype(jnp.int32).reshape(-1)
+        r, slab = tx._payload(packed, rank, width)
+        out, gathered, sems = pl.pallas_call(
+            start_kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=2,
+                in_specs=[tx._HBM, tx._HBM],
+                out_specs=(tx._HBM, tx._HBM, _SEM),
+                grid=(),
+            ),
+            out_shape=(
+                jax.ShapeDtypeStruct((ep, slab_rows, LANES), jnp.int32),
+                jax.ShapeDtypeStruct((n_rows, *rows.shape[1:]), rows.dtype),
+                pltpu.SemaphoreType.DMA((_N_SPLIT_SEMS,)),
+            ),
+            compiler_params=tx._compiler_params(),
+            name=_exchange_name(
+                ep,
+                width,
+                n_rows,
+                light_prepush,
+                single_barrier,
+                "_start",
+                scatter_rows,
+            ),
+        )(r, idx, slab, rows)
+        return r, slab, out, gathered, sems
+
+    def done(handle, rows, seg_start_local):
+        r, slab, out, gathered, sems = handle
+        vmem = pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM)
+        out, gathered, *tables = pl.pallas_call(
+            done_kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=1,
+                in_specs=[tx._HBM, tx._HBM, tx._HBM, tx._HBM, _SEM, vmem],
+                out_specs=(tx._HBM, tx._HBM) + (vmem,) * N_TABLE_OUTS,
+                scratch_shapes=(pltpu.SemaphoreType.DMA,) + _table_scratch(ep, n_cnt),
+                grid=(),
+            ),
+            out_shape=(
+                jax.ShapeDtypeStruct(out.shape, out.dtype),
+                jax.ShapeDtypeStruct(gathered.shape, gathered.dtype),
+            )
+            + _table_out_shapes(ep, g),
+            input_output_aliases={3: 0, 4: 1},
+            compiler_params=pltpu.CompilerParams(disable_bounds_checks=True),
+            name=_exchange_name(
+                ep,
+                width,
+                n_rows,
+                light_prepush,
+                single_barrier,
+                "_done",
+                scatter_rows,
+            ),
+        )(r, slab, rows, out, gathered, sems, _seg3(seg_start_local, ep, g))
+        # The raw [ep, rows, 128] payload last, for build_pair_tables.
+        return (tx._unpad(out, ep, width), gathered) + _unpack_tables(tables) + (out,)
+
+    return start, done
+
+
+def build_exchange_rows_tables_split(
+    *,
+    ep,
+    width,
+    n_rows,
+    count_at,
+    e_total,
+    n_pre,
+    tile_m,
+    light_prepush=0,
+    single_barrier=False,
+    scatter_rows=False,
+):
+    """build_exchange_rows_tables' kernel as two calls, so independent work
+    can run while its rows are in flight: start(packed, rank, rows, idx) ->
+    handle (barrier, every push and row copy issued, none waited);
+    done(handle, rows, seg_start_local) -> build_exchange_rows_tables'
+    outputs. `rows` goes to both, keeping it live for the copies reading it.
+    The handle holds buffers peers are still writing: it is opaque, and goes
+    to done once and to nothing else (a copy of it would read rows mid-flight)."""
+    g = e_total // ep
+    if g > LANES or ep > LANES or 2 * g + 3 > LANES:
+        raise ValueError(f"the table kernel takes g_local, ep <= {LANES}")
+    return _build_exchange_rows_tables_split(
+        ep,
+        width,
+        n_rows,
+        count_at,
+        g,
+        int(n_pre),
+        int(tile_m),
+        int(light_prepush),
+        bool(single_barrier),
+        bool(scatter_rows),
+    )
+
+
+def pair_tables_apply(t_local, topk, scale_at, scale_rows):
+    """Whether build_pair_tables serves this step: every shard's routed pairs
+    in one payload row, its row scales in the next, and an f32 scale slab."""
+    n = t_local * topk
+    return n <= LANES and scale_at == LANES and t_local <= LANES and scale_rows > 0
+
+
+@functools.cache
+def _build_pair_tables(ep, g, t_local, topk, block, e_total, scale_rows, interpret):
+    n = t_local * topk
+    a_rows = -(-4 * scale_rows // 16) * 16
+
+    def kernel(me_sm, out_hbm, rb_ref, mb_ref, run_ref, pos_o, mir_o, slab_o,
+               pay_vm, slab_vm, sem):  # fmt: skip
+        i32, bf16, f32 = jnp.int32, jnp.bfloat16, jnp.float32
+        me = me_sm[0]
+        cp = pltpu.make_async_copy(out_hbm.at[:, pl.ds(0, 2), :], pay_vm, sem)
+        cp.start()
+        cp.wait()
+        pairs = pay_vm[:, 0, :]  # [s, q]: source s's q-th routed pair's expert
+        sbits = pay_vm[:, 1, :]  # [s, t]: source s's token t's row-scale bits
+        pairs_t = _transpose(pairs)  # [q, s]
+        shape = (LANES, LANES)
+        sub = lax.broadcasted_iota(i32, shape, 0)  # the pair q (rows)
+        lane = lax.broadcasted_iota(i32, shape, 1)
+        earlier = lane < sub  # [q, q']: q' before q
+        row8 = lax.broadcasted_iota(i32, (ep, LANES), 0)
+
+        def col(x, s):
+            """Column s of a [q, s] tile, as [q, 1]."""
+            return jnp.sum(_sel(lane == s, x), 1, keepdims=True)
+
+        def lookup(table_row, idx):
+            """table_row[0, idx[q]] for an [1, 128] table, [q, 1] -> [q, 1]."""
+            return jnp.sum(_sel(idx == lane, table_row), 1, keepdims=True)
+
+        # This shard's own pairs: arrival row and mirror position. A pair
+        # routed nowhere keeps the plan's rank within its routing block.
+        e_me = col(pairs_t, me)
+        me_pairs = jnp.sum(_sel(row8 == me, pairs), 0, keepdims=True)
+        same_me = (e_me == me_pairs) & earlier
+        before = jnp.sum(same_me.astype(i32), 1, keepdims=True)
+        blk = pow2_shift(block, "the routing block")
+        same_block = (sub >> blk) == (lane >> blk)
+        in_block = jnp.sum((same_me & same_block).astype(i32), 1, keepdims=True)
+        rb = rb_ref[...]
+        mb = mb_ref[...]
+        base = sum(lookup(rb[:, c * LANES : (c + 1) * LANES], e_me - c * LANES)
+                   for c in range(rb.shape[1] // LANES))  # fmt: skip
+        mbase = sum(lookup(mb[:, c * LANES : (c + 1) * LANES], e_me - c * LANES)
+                    for c in range(mb.shape[1] // LANES))  # fmt: skip
+        routed = (e_me >= 0) & (e_me < e_total)
+        pos = jnp.where(routed, base + before, in_block)
+        mir = jnp.where(routed, mbase + before, in_block)
+        both = jnp.where(lane == 0, pos, jnp.where(lane == 1, mir, 0)).T
+        pos_o[...] = both[0:1, :]
+        mir_o[...] = both[1:2, :]
+
+        # The scale slab: source s's pair q on one of this shard's experts
+        # lands on run_base[s, e - first] plus its rank among the source's
+        # pairs on that expert, and carries its token's row-scale bits. Built
+        # as layer._scale_slab_onehot builds it (same exactness argument),
+        # with the operand rows ordered byte-major per source.
+        first = me * g
+        token_of = (sub >= lane * topk) & (sub < (lane + 1) * topk)  # [q, t]
+        r_a = lax.broadcasted_iota(i32, (a_rows, LANES), 0)
+        # Operand row r holds byte r // scale_rows of slab row r % scale_rows.
+        byte_of = sum((r_a >= b * scale_rows).astype(i32) for b in range(1, 4))
+        hi_of = r_a - byte_of * scale_rows
+        acc = jnp.zeros((a_rows, LANES), f32)
+        run = run_ref[...]
+        for s in range(ep):
+            e_s = col(pairs_t, s)
+            loc = e_s - first
+            mine = (loc >= 0) & (loc < g) & (sub[:, :1] < n)
+            rank = jnp.sum(
+                ((e_s == pairs[s : s + 1]) & earlier).astype(i32), 1, keepdims=True
+            )
+            row = lookup(run[s : s + 1], loc) + rank
+            row = jnp.where(mine, row, scale_rows * LANES)  # off the slab: dropped
+            bits = jnp.sum(_sel(token_of, sbits[s : s + 1]), 1, keepdims=True)
+            hi = row >> 7
+            lo = row & (LANES - 1)
+            cols = jnp.where(lane == 0, hi, 0)
+            for b in range(4):
+                cols = jnp.where(lane == 1 + b, (bits >> (8 * b)) & 255, cols)
+            rows = cols.T  # row 0: hi, rows 1-4: the bytes
+            byte = jnp.zeros((a_rows, LANES), i32)
+            for b in range(4):
+                byte = jnp.where(byte_of == b, rows[1 + b : 2 + b], byte)
+            a = _sel((hi_of == rows[0:1]) & (r_a < 4 * scale_rows), byte)
+            onehot = (lo == lane).astype(bf16)  # [q, lane]
+            acc = acc + jnp.dot(a.astype(bf16), onehot, preferred_element_type=f32)
+        words = acc.astype(i32)
+        w = words[0:scale_rows]
+        for b in range(1, 4):
+            w = w | (words[b * scale_rows : (b + 1) * scale_rows] << (8 * b))
+        slab_vm[...] = lax.bitcast_convert_type(w, f32)
+        out = pltpu.make_async_copy(slab_vm, slab_o, sem)
+        out.start()
+        out.wait()
+
+    vmem = pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM)
+    hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[hbm, vmem, vmem, vmem],
+            out_specs=(vmem, vmem, hbm),
+            scratch_shapes=(
+                pltpu.VMEM((ep, 2, LANES), jnp.int32),
+                pltpu.VMEM((scale_rows, LANES), jnp.float32),
+                pltpu.SemaphoreType.DMA,
+            ),
+            grid=(),
+        ),
+        out_shape=(
+            jax.ShapeDtypeStruct((1, LANES), jnp.int32),
+            jax.ShapeDtypeStruct((1, LANES), jnp.int32),
+            jax.ShapeDtypeStruct((scale_rows, LANES), jnp.float32),
+        ),
+        interpret=interpret,
+        name=f"moe_push_pair_tables_ep{ep}_t{t_local}_k{topk}",
+    )
+
+
+def build_pair_tables(
+    exchange_out, recv_base, mirror_base, run_base, me, *, ep, t_local, topk,
+    block, e_total, scale_rows, interpret=False,
+):  # fmt: skip
+    """routing_pairs_from_tables' arrival rows and mirror positions for this
+    shard's pairs, and the activation scale slab its routed pairs fill, in one
+    kernel straight from the exchanged payload (`exchange_out`, the exchange
+    kernel's [ep, rows, 128] HBM output: pairs in row 0, row-scale bits in
+    row 1). `recv_base`/`mirror_base` [e_total] and `run_base` [ep, g] are the
+    table kernel's plan tables. Same integers as host.routing_pairs_from_tables
+    and the scale slab's drop-mode scatter (every routed pair has a slab row
+    of its own). Returns (pos [t_local, topk], mirror_pos, scale slab
+    f32 [scale_rows, 128])."""
+    g = e_total // ep
+    pad = (-e_total) % LANES
+    call = _build_pair_tables(
+        ep, g, t_local, topk, block, e_total, scale_rows, interpret
+    )
+    # No with_memory_space_constraint on the payload or the slab (unlike the
+    # decode combine): pinning them made the kernel wait on the payload's HBM
+    # read (layer bench: 3.3 vs 1.95 us).
+    pos, mir, slab = call(
+        jnp.asarray(me, jnp.int32).reshape(1),
+        exchange_out,
+        jnp.pad(recv_base.astype(jnp.int32), (0, pad)).reshape(1, -1),
+        jnp.pad(mirror_base.astype(jnp.int32), (0, pad)).reshape(1, -1),
+        jnp.pad(run_base.astype(jnp.int32), ((0, 0), (0, LANES - g))),
+    )
+    n = t_local * topk
+    return (
+        pos[0, :n].reshape(t_local, topk),
+        mir[0, :n].reshape(t_local, topk),
+        slab,
+    )
+
+
+# Largest step build_local_ranks / build_pair_rows take: their words pack
+# a pair's sorted row or rank in 16 bits (below 2**15, so the sign is clear),
+# and they unroll one loop body per 1024 pairs.
+WIDE_PAIRS_MAX = 1 << 14
+
+
+def wide_pair_tables_apply(t_local, topk, block):
+    """Whether build_local_ranks / build_pair_rows serve this step: more
+    routed pairs than build_pair_tables takes, at most WIDE_PAIRS_MAX, in
+    whole-lane routing blocks and whole [8, 128] tiles of pairs."""
+    n = t_local * topk
+    return (
+        LANES < n <= WIDE_PAIRS_MAX
+        and block in (LANES, 2 * LANES)
+        and n % (8 * LANES) == 0
+    )
+
+
+def _align(v, m):
+    return -(-v // m) * m
+
+
+def _lookup_rows(table, idx):
+    """table[r, idx[r, l]] per element of an int32 [8, 128] tile, for [8, k]
+    tables (k a multiple of 128) and 0 <= idx: in-register lane gathers,
+    one per 128 entries; an index past the table reads 0."""
+    out = jnp.zeros(idx.shape, table.dtype)
+    for t in range(table.shape[1] // LANES):
+        got = jnp.take_along_axis(
+            table[:, t * LANES : (t + 1) * LANES],
+            idx & (LANES - 1),
+            axis=1,
+            mode="promise_in_bounds",
+        )
+        out = jnp.where((idx >> 7) == t, got, out)
+    return out
+
+
+def _lookup(table, idx):
+    """_lookup_rows with one [1, k] table for every row."""
+    return _lookup_rows(jnp.broadcast_to(table, (idx.shape[0], table.shape[1])), idx)
+
+
+@functools.cache
+def _build_local_ranks(n, e_total, topk, block, interpret):
+    i32, bf16, f32 = jnp.int32, jnp.bfloat16, jnp.float32
+    nc = n // LANES  # 128-pair chunks, 8 to a tile
+    ncp = _align(nc, LANES)
+    kp = _align(e_total + 1, LANES)  # expert bins, nowhere (e_total) included
+    cpb = block // LANES
+    t_local = n // topk
+
+    def kernel(pairs_ref, counts_o, seg_o, rowmap_o, words_o, hist_vm, carry_vm):
+        sub = lax.broadcasted_iota(i32, (8, LANES), 0)
+        lane = lax.broadcasted_iota(i32, (8, LANES), 1)
+
+        def experts(i):
+            rows = pl.ds(pl.multiple_of(8 * i, 8), 8)
+            return rows, jnp.minimum(pairs_ref[rows, :], e_total)
+
+        # Pass 1: a tile's 8 chunk histograms in one matmul over its pairs:
+        # [(high bits h, chunk j), (chunk j', pair)] one-hot (j == j') times
+        # the low 7 bits' one-hot [128, (chunk j', pair)] transposed counts
+        # bin 128 * h + l of chunk j in row 8 * h + j, lane l.
+        n_high = kp // LANES
+        hj = lax.broadcasted_iota(i32, (8 * n_high, LANES), 0)
+        sub_sq = lax.broadcasted_iota(i32, (LANES, LANES), 0)
+
+        def count(i, carry):
+            rows, e = experts(i)
+            high = jnp.concatenate(
+                [
+                    ((hj & 7) == j) & ((hj >> 3) == (e[j : j + 1] >> 7))
+                    for j in range(8)
+                ],
+                1,
+            ).astype(bf16)
+            low = jnp.concatenate(
+                [sub_sq == (e[j : j + 1] & (LANES - 1)) for j in range(8)], 1
+            ).astype(bf16)
+            h = lax.dot_general(
+                high, low, (((1,), (1,)), ((), ())), preferred_element_type=f32
+            )
+            hist_vm[rows, :] = jnp.concatenate(
+                [h[8 * t : 8 * (t + 1)] for t in range(n_high)], 1
+            )
+            return carry
+
+        hist_vm[...] = jnp.zeros((ncp, kp), f32)
+        lax.fori_loop(0, nc // 8, count, 0, unroll=True)
+        # Each expert's pairs in earlier chunks: a strictly-lower-triangular
+        # matmul over counts <= 128 (exact in bf16), sums <= n exact in f32.
+        r = lax.broadcasted_iota(i32, (ncp, ncp), 0)
+        before = (lax.broadcasted_iota(i32, (ncp, ncp), 1) < r).astype(bf16)
+        hist = hist_vm[...]
+        carry_vm[...] = jnp.dot(
+            before, hist.astype(bf16), preferred_element_type=f32
+        ).astype(i32)
+        total = jnp.sum(hist, 0, keepdims=True).astype(i32)  # [1, kp]
+        # Segment starts; nowhere's run follows every routed pair.
+        seg, start = [], jnp.zeros((1, 1), i32)
+        for t in range(kp // LANES):
+            cnt = total[:, t * LANES : (t + 1) * LANES]
+            seg.append(_lane_excl_cumsum(cnt) + start)
+            start = start + jnp.sum(cnt, 1, keepdims=True)
+            w = min(LANES, e_total - t * LANES)
+            if w > 0:
+                counts_o[pl.ds(t * LANES, w)] = cnt[0, :w]
+                seg_o[pl.ds(t * LANES, w)] = seg[-1][0, :w]
+        seg = jnp.concatenate(seg, 1)
+
+        # Pass 2: a pair's rank is its chunk's carry for its expert (a lane
+        # gather per sublane) plus the same-expert pairs before it in the
+        # chunk (a pairwise compare).
+        earlier = lax.broadcasted_iota(i32, (LANES, LANES), 0) < lax.broadcasted_iota(
+            i32, (LANES, LANES), 1
+        )
+
+        def place(i, carry):
+            rows, e = experts(i)
+            carry_rows = carry_vm[rows, :]
+            e_t = _transpose(e)  # [pair, chunk]
+            w = jnp.zeros((8, LANES), i32)
+            for j in range(8):
+                other = jnp.broadcast_to(e_t[:, j : j + 1], (LANES, LANES))
+                same = other == jnp.broadcast_to(e[j : j + 1], (LANES, LANES))
+                w_j = jnp.sum((same & earlier).astype(i32), 0, keepdims=True)
+                w = jnp.where(sub == j, w_j, w)
+            rank = _lookup_rows(carry_rows, e) + w
+            # A pair routed nowhere keeps the plan's rank within its routing
+            # block: less the nowhere pairs before the block.
+            at_nowhere = _lookup_rows(carry_rows, jnp.full(e.shape, e_total, i32))
+            blk0 = jnp.take_along_axis(
+                at_nowhere, sub - sub % cpb, axis=0, mode="promise_in_bounds"
+            )
+            nowhere = e == e_total
+            # p // topk in f32: |error| < n * 2**-23, far inside the 0.5 / topk
+            # margin to the next integer.
+            p = ((8 * i + sub) * LANES + lane).astype(f32) + 0.5
+            src = jnp.where(nowhere, t_local - 1, (p * (1.0 / topk)).astype(i32))
+            rowmap_o[rows, :] = (_lookup(seg, e) + rank) | (src << 16)
+            words_o[rows, :] = e | (jnp.where(nowhere, rank - blk0, rank) << 16)
+            return carry
+
+        lax.fori_loop(0, nc // 8, place, 0, unroll=True)
+
+    vmem = pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM)
+    return pl.pallas_call(
+        kernel,
+        in_specs=[vmem],
+        out_specs=(vmem,) * 4,
+        out_shape=(
+            jax.ShapeDtypeStruct((e_total,), i32),
+            jax.ShapeDtypeStruct((e_total,), i32),
+            jax.ShapeDtypeStruct((nc, LANES), i32),
+            jax.ShapeDtypeStruct((nc, LANES), i32),
+        ),
+        scratch_shapes=(
+            pltpu.VMEM((ncp, kp), f32),
+            pltpu.VMEM((ncp, kp), i32),
+        ),
+        interpret=interpret,
+        name=f"moe_push_local_ranks_n{n}_e{e_total}",
+    )
+
+
+def build_local_ranks(local_pairs, *, e_total, topk, block, interpret=False):
+    """This shard's routed pairs ranked in one kernel, for a step
+    wide_pair_tables_apply admits. `local_pairs` [t_local * topk] are expert
+    ids in [0, e_total], e_total routing nowhere. Returns (counts [e_total],
+    seg_start [e_total] (host.local_sort_tokens'), row_map [n], words [n]):
+    row_map[p] = the expert-sorted row of pair p | its source token << 16,
+    the token host.local_sort_tokens puts on that row (the exchange kernel's
+    `scatter_rows` map), and words[p] = its expert | its rank << 16, the
+    payload word build_pair_rows reads: the rank among this shard's earlier
+    pairs on its expert or, routed nowhere, within its routing block."""
+    n = local_pairs.shape[0]
+    counts, seg, row_map, words = _build_local_ranks(
+        n, e_total, topk, block, interpret
+    )(local_pairs.astype(jnp.int32).reshape(n // LANES, LANES))
+    return counts, seg, row_map.reshape(n), words.reshape(n)
+
+
+@functools.cache
+def _build_pair_rows(ep, g, n, e_total, off_shard, shard_stride, interpret):
+    i32 = jnp.int32
+    nc = n // LANES
+    tiles = nc // 8
+
+    def kernel(me_sm, pay_vm, rb_ref, mb_ref, run_ref, pos_o, mir_o, slab_o):
+        me = me_sm[0]
+        rb, mb = rb_ref[...], mb_ref[...]
+
+        def local(i, carry):
+            rows = pl.ds(pl.multiple_of(8 * i, 8), 8)
+            w = pay_vm[me, rows, :]
+            e, r = w & 0xFFFF, w >> 16
+            pos_o[rows, :] = r + _lookup(rb, e)
+            mir_o[rows, :] = r + _lookup(mb, e)
+            return carry
+
+        lax.fori_loop(0, tiles, local, 0, unroll=True)
+
+        # A pair on one of this shard's experts lands on its (source, expert)
+        # run's slab row plus its rank among the source's pairs on that expert.
+        first = me * g
+        off = off_shard - me * shard_stride
+        run = jnp.concatenate([run_ref[...], jnp.zeros((ep, LANES - g), i32)], 1)
+        for s in range(ep):
+
+            def slab(i, carry, s=s):
+                w = pay_vm[s, pl.ds(pl.multiple_of(8 * i, 8), 8), :]
+                loc = (w & 0xFFFF) - first
+                mine = (loc >= 0) & (loc < g)
+                got = _lookup(run[s : s + 1], jnp.where(mine, loc, 0)) + (w >> 16)
+                at = pl.ds(pl.multiple_of(s * nc + 8 * i, 8), 8)
+                slab_o[at, :] = jnp.where(mine, got, off)
+                return carry
+
+            lax.fori_loop(0, tiles, slab, 0, unroll=True)
+
+    vmem = pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM)
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[vmem] * 4,
+            out_specs=(vmem, vmem, vmem),
+            grid=(),
+        ),
+        out_shape=(
+            jax.ShapeDtypeStruct((nc, LANES), i32),
+            jax.ShapeDtypeStruct((nc, LANES), i32),
+            jax.ShapeDtypeStruct((ep * nc, LANES), i32),
+        ),
+        interpret=interpret,
+        name=f"moe_push_pair_rows_ep{ep}_n{n}",
+    )
+
+
+def build_pair_rows(
+    exchange_out, recv_base, mirror_base, run_base, me, *, ep, t_local, topk,
+    e_total, shard_stride, interpret=False,
+):  # fmt: skip
+    """host.routing_pairs_from_tables' (pos, mirror_pos, slab_row) for a step
+    wide_pair_tables_apply admits, in one kernel: from the exchanged payload
+    (`exchange_out`, the exchange kernel's raw [ep, rows, 128] output, every
+    source's build_local_ranks words in its leading rows) and the table
+    kernel's plan tables (`recv_base`/`mirror_base` [e_total], `run_base`
+    [ep, g]). Same integers."""
+    g = e_total // ep
+    n = t_local * topk
+    ke = _align(e_total, LANES)
+    call = _build_pair_rows(
+        ep, g, n, e_total, off_shard_slab_row(shard_stride, ep), shard_stride,
+        interpret,
+    )  # fmt: skip
+    pad = ((0, ke - e_total),)
+    pos, mir, slab_row = call(
+        jnp.asarray(me, jnp.int32).reshape(1),
+        exchange_out,
+        jnp.pad(recv_base.astype(jnp.int32), pad).reshape(1, ke),
+        jnp.pad(mirror_base.astype(jnp.int32), pad).reshape(1, ke),
+        run_base.astype(jnp.int32),
+    )
+    return pos.reshape(t_local, topk), mir.reshape(t_local, topk), slab_row.reshape(-1)

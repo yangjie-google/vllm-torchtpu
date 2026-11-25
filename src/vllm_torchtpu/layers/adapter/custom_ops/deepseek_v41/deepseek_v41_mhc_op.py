@@ -43,9 +43,35 @@ def _post_pre_rms_jax(
             pad, x, flat, post, comb, weight, scale, base, pre, norm_weight,
             rms_eps, pre_eps, sinkhorn_eps, post_multiplier, repeats, norm_eps,
         )
-    if not shifted_post_pre_rms.is_supported_shape(tokens, mult, dim) or (
-        tokens % 32 and not envs.TPU_DEEPSEEK_V41_MHC_SHIFTED_T16
-    ):
+    padded = -(-tokens // 16) * 16
+    if padded != tokens and _kernel_admits(padded, mult, dim):
+        # Rows are independent: zero rows (DSpark's 40-row draft bucket) run
+        # the kernel at the next whole 16-token tile and are sliced off.
+        def zero_pad(a):
+            return jnp.pad(a, ((0, padded - tokens),) + ((0, 0),) * (a.ndim - 1))
+
+        outputs = _post_pre_rms_jax(
+            zero_pad(x.reshape(tokens, -1)),
+            zero_pad(flat),
+            zero_pad(post),
+            zero_pad(comb),
+            weight,
+            scale,
+            base,
+            zero_pad(pre),
+            norm_weight,
+            rms_eps,
+            pre_eps,
+            sinkhorn_eps,
+            post_multiplier,
+            repeats,
+            norm_eps,
+        )
+        return cast(
+            tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+            tuple(out[:tokens] for out in outputs),
+        )
+    if not _kernel_admits(tokens, mult, dim):
         from vllm_torchtpu.models.vllm.deepseek_v41.common.mhc import (
             delayed_post_pre_flat_jax,
         )
@@ -131,9 +157,19 @@ def _padded_post_pre_rms(
     return tuple(o[:tokens] for o in out)
 
 
+def _kernel_admits(tokens: int, mult: int, dim: int) -> bool:
+    return shifted_post_pre_rms.is_supported_shape(tokens, mult, dim) and (
+        tokens % 32 == 0 or envs.TPU_DEEPSEEK_V41_MHC_SHIFTED_T16
+    )
+
+
 def _gate_layout() -> dict:
     layout: dict = {"early_prep": envs.TPU_DEEPSEEK_V41_MHC_EARLY_PREP}
-    if envs.TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES:
+    if envs.TPU_DEEPSEEK_V41_MHC_FUSED_GATES:
+        layout["unpadded_gates"] = True
+        layout["fused_gates"] = True
+        layout["gate_input_mode"] = shifted_post_pre_rms.GateInputMode.HBM
+    elif envs.TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES:
         layout["unpadded_gates"] = True
         layout["gate_input_mode"] = shifted_post_pre_rms.GateInputMode.COMPILER
     return layout

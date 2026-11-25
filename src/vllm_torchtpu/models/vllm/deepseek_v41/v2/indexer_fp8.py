@@ -15,6 +15,7 @@ from vllm_torchtpu.kernels.deepseek_v41 import (
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
     block_topk,
+    publication,
     streaming_topk,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.cache import (
@@ -41,6 +42,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.tuned import (
     PACKED_FP8_MQA_CONFIG,
     indexer_query_rows,
     paged_mqa_key_tile,
+    paged_mqa_query_tile,
     topk_reconstruction_threshold,
 )
 
@@ -467,6 +469,7 @@ def _select_fp8_indexer_jax(
     score_width: int,
     *,
     prefill_chunk_rows: int | None = None,
+    reuse_keys: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     layout = PackedFP8Layout(*layout_args)
     tokens, width = q.shape[0], score_width
@@ -586,16 +589,35 @@ def _select_fp8_indexer_jax(
     # Decode top-k scans only the blocks that can hold a winner. Publishing
     # layers rank the same SparseCore block maxima for their candidates.
     select_block = block_size if publish_rows else _BLOCK_TOPK_BLOCK
-    block_select = (
-        stream_select
-        and prefill_chunk_rows is None
-        and chunk_rows is not None
-        and block_topk.is_supported(chunk_rows, capacity, topk, select_block)
+    decode_tiles = (
+        stream_select and prefill_chunk_rows is None and chunk_rows is not None
+    )
+    block_select = decode_tiles and block_topk.is_supported(
+        chunk_rows, capacity, topk, select_block, given_maxima=True
+    )
+    # Publishing layers whose block maxima overflow SparseCore VMEM (1M-token
+    # contexts) select over blocks twice as wide, whose maxima block top-k
+    # folds from the scorer's, and publish from the scorer's directly.
+    folded_select = (
+        decode_tiles
+        and publish_rows
+        and not block_select
+        and block_topk.is_supported(
+            chunk_rows,
+            capacity,
+            topk,
+            2 * select_block,
+            given_maxima=True,
+            maxima_block=select_block,
+        )
     )
     pool = banks[0] if len(banks) == 1 else banks
 
-    def score(start, rows, inputs, *, pipelined, group=None):
-        """Scores of `rows` queries from `start`; decode tiles share the inputs."""
+    def score(start, rows, inputs, *, pipelined, group=None, maxima=False):
+        """Scores of `rows` queries from `start`; decode tiles share the inputs.
+
+        `maxima` also returns the scores' block maxima for block top-k.
+        """
         shared = pipelined and prefill_chunk_rows is None
         queries, row_weights, row_lengths = (
             inputs[:3]
@@ -620,7 +642,13 @@ def _select_fp8_indexer_jax(
             cache_layout=layout,
             query_start=start if shared else 0,
             query_count=rows,
-            reuse_keys=prefill_chunk_rows is not None and capacity == key_tile,
+            reuse_keys=reuse_keys,
+            # Its readers mask each row at its length, reading -inf at most to
+            # the end of the row's last 8-key block, which a scored tile holds.
+            fill_unscored=not stream_select,
+            # The scorer holds every score; reducing them there saves block
+            # top-k a SparseCore pass over the whole visible row.
+            block_maxima=select_block if maxima else 0,
         )
         if group is None:
             return scores
@@ -676,7 +704,30 @@ def _select_fp8_indexer_jax(
         row_lengths = jax.lax.dynamic_slice_in_dim(
             inputs[2], tile * chunk_rows, chunk_rows
         )
+        if folded_select:
+            scores, maxima = scores
+            selected = block_topk.block_topk(
+                scores,
+                row_lengths,
+                k=topk,
+                block_size=2 * select_block,
+                maxima=maxima,
+                maxima_block=select_block,
+                scheduling_group_id=group,
+            )
+            return selected, _publish_candidate_blocks(
+                scores,
+                row_lengths,
+                candidates.shape[1],
+                block_size,
+                unordered,
+                block_scores=publication.visible_block_scores(
+                    maxima, row_lengths, block_size=block_size
+                ),
+                scheduling_group_id=group,
+            )
         if block_select:
+            scores, maxima = scores
             # One SparseCore pass ranks the block maxima for both outputs.
             return block_topk.block_topk(
                 scores,
@@ -684,6 +735,7 @@ def _select_fp8_indexer_jax(
                 k=topk,
                 block_size=select_block,
                 publish=candidates.shape[1] if publish_rows else 0,
+                maxima=maxima,
                 scheduling_group_id=group,
             )
         selected = select_topk(
@@ -721,7 +773,12 @@ def _select_fp8_indexer_jax(
         padded // chunk_rows,
         lambda tile: tile * chunk_rows,
         lambda start, group: score(
-            start, chunk_rows, inputs, pipelined=True, group=group
+            start,
+            chunk_rows,
+            inputs,
+            pipelined=True,
+            group=group,
+            maxima=block_select or folded_select,
         ),
         select,
         write,
@@ -796,14 +853,23 @@ def select_fp8_indexer_jax(
     ):
         return _select_fp8_indexer_jax(*arguments, score_width)
 
-    # Preserve score-buffer row boundaries for both widths. Only contexts
-    # covered by one K tile can narrow the scores and retain their keys.
+    # Preserve score-buffer row boundaries for both widths. Contexts that fit
+    # the scorer's K buffers narrow the scores and keep their keys resident,
+    # which pays only when requests span several query groups: one-group
+    # requests (decode rows) keep the streaming kernel's cross-group prefetch.
+    resident = min(score_width, width * PACKED_FP8_MQA_CONFIG.key_buffers)
     live = (requests >= 0) & (requests < page_table.shape[0])
     longest = jnp.where(live, lengths, 0).max()
     grouped = jnp.all(requests[1:] >= requests[:-1])
+    rows = query_start_loc[-1] - query_start_loc[0]
+    spans = (query_start_loc[1:] > query_start_loc[:-1]).sum()
+    group = paged_mqa_query_tile(PACKED_FP8_MQA_CONFIG.query_tile, q.shape[1])
+    shared_keys = rows >= 2 * group * spans
     return jax.lax.cond(
-        grouped & (longest <= width),
-        lambda: _select_fp8_indexer_jax(*arguments, width, prefill_chunk_rows=chunk),
+        grouped & shared_keys & (longest <= resident),
+        lambda: _select_fp8_indexer_jax(
+            *arguments, resident, prefill_chunk_rows=chunk, reuse_keys=True
+        ),
         lambda: _select_fp8_indexer_jax(
             *arguments, score_width, prefill_chunk_rows=chunk
         ),
@@ -844,25 +910,22 @@ def _select_from_prepared_candidates(
 ) -> jax.Array:
     gathered_candidates = PreparedCandidates(*gathered_candidates)
     lengths = jnp.where(gathered_candidates.valid_queries, lengths, 0)
-
-    def short():
-        ids = jnp.broadcast_to(
-            jnp.arange(min(topk, context_width), dtype=jnp.int32),
-            (q.shape[0], min(topk, context_width)),
-        )
-        return jnp.where(ids < lengths[:, None], ids, -1)
-
-    return jax.lax.cond(
-        jnp.max(lengths) <= topk,
-        short,
-        lambda: _score_and_select_candidates(
-            q,
-            weights,
-            lengths,
-            gathered_candidates,
-            topk,
-            candidate_block_size,
-            unordered,
-            context_width,
-        ),
+    ids = jnp.broadcast_to(
+        jnp.arange(min(topk, context_width), dtype=jnp.int32),
+        (q.shape[0], min(topk, context_width)),
     )
+    visible = jnp.where(ids < lengths[:, None], ids, -1)
+    selected = _score_and_select_candidates(
+        q,
+        weights,
+        lengths,
+        gathered_candidates,
+        topk,
+        candidate_block_size,
+        unordered,
+        context_width,
+    )
+    # A select, not a cond: a branch costs an overlay load at its entry and
+    # keeps XLA from overlapping the selection with the layer's other work.
+    # Scoring therefore also runs on short contexts and must accept them.
+    return jnp.where(jnp.max(lengths) <= topk, visible, selected)

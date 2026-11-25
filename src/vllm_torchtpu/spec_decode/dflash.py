@@ -28,6 +28,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
+    compile_draft_model_call,
     fit_rows,
     maybe_share_embeddings,
     maybe_share_lm_head,
@@ -112,6 +113,11 @@ class DFlashProposer:
         # shape, see `_dummy_kv_update_inputs`.
         self._dummy_kv_input_cache: dict[
             tuple, tuple[list[torch.Tensor], AttentionMetadata]
+        ] = {}
+        # Keyed by (num_tokens, use_max_model_len); lockstep replay shapes,
+        # see `_dummy_draft_forward`.
+        self._dummy_draft_input_cache: dict[
+            tuple[int, bool], tuple[torch.Tensor, torch.Tensor, dict]
         ] = {}
         # Keyed by the chunk's padded request count; the all-zero
         # `draft_lengths` a chunk without spec metadata routes on.
@@ -764,6 +770,44 @@ class DFlashProposer:
                 f"its query block size {block_size}"
             )
 
+        # A lockstep replay (not `sync`) runs every idle step on the same
+        # inputs: build them once per shape.
+        key = (num_tokens, use_max_model_len)
+        cached = None if sync else self._dummy_draft_input_cache.get(key)
+        if cached is None:
+            cached = self._dummy_draft_inputs(num_tokens, use_max_model_len)
+            if not sync:
+                self._dummy_draft_input_cache[key] = cached
+        input_ids, positions, per_layer_attn_metadata = cached
+        # Every row of a dummy draft forward is padding, as in the runner's
+        # warmup steps.
+        token_padding.mark_padding(0, num_tokens)
+
+        with (
+            # Same contract as propose(): precomputed DP metadata, no
+            # hidden per-forward cross-DP all_reduce.
+            set_forward_context(
+                per_layer_attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens,
+                num_tokens_across_dp=runner._dp_num_tokens_across_dp(num_tokens),
+            ),
+            set_vllm_model_wrapper_context(
+                mesh=self.runner.mesh, vllm_config=self.vllm_config
+            ),
+        ):
+            draft_tokens_chunk, _ = self._dflash_forward_and_sample(
+                input_ids, positions, block_size
+            )
+            synchronize_tensors(draft_tokens_chunk, wait=sync)
+
+    def _dummy_draft_inputs(
+        self, num_tokens: int, use_max_model_len: bool
+    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        """Token ids, positions and draft attention metadata of one dummy
+        draft forward of `num_tokens` (whole query blocks)."""
+        runner = self.runner
+        block_size = self.block_size
         input_ids = torch.zeros((num_tokens), dtype=torch.int32).to(runner.device)
         positions = torch.zeros(num_tokens, dtype=torch.int32).to(runner.device)
 
@@ -786,27 +830,7 @@ class DFlashProposer:
             position_ids_override=positions,
             padded_num_reqs=padded_num_reqs,
         )
-        # Every row of a dummy draft forward is padding, as in the runner's
-        # warmup steps.
-        token_padding.mark_padding(0, num_tokens)
-
-        with (
-            # Same contract as propose(): precomputed DP metadata, no
-            # hidden per-forward cross-DP all_reduce.
-            set_forward_context(
-                per_layer_attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens,
-                num_tokens_across_dp=runner._dp_num_tokens_across_dp(num_tokens),
-            ),
-            set_vllm_model_wrapper_context(
-                mesh=self.runner.mesh, vllm_config=self.vllm_config
-            ),
-        ):
-            draft_tokens_chunk, _ = self._dflash_forward_and_sample(
-                input_ids, positions, block_size
-            )
-            synchronize_tensors(draft_tokens_chunk, wait=sync)
+        return input_ids, positions, per_layer_attn_metadata
 
     def _dp_draft_bucket(self) -> int:
         """Draft-forward token bucket every lockstep rank runs this step."""
@@ -878,7 +902,7 @@ class DFlashProposer:
         for _ in range(num_chunks):
             self._dp_dummy_forward()
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @compile_draft_model_call
     def _tpu_precompute_and_update_kv_cache(
         self,
         hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor] | torch.Tensor,
@@ -990,7 +1014,7 @@ class DFlashProposer:
 
         return hidden_states
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @compile_draft_model_call
     def _dflash_forward_and_sample(
         self,
         input_ids: torch.Tensor,

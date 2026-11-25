@@ -205,6 +205,23 @@ if envs.TPU_INLINE_DEDUPLICATED_CALLS and not _user_has_flag(
 ):
     _libtpu_extra_args.append("--xla_tpu_enable_deduplicated_calls=false")
 
+# --xla_tpu_enable_offloading_sort_to_sparsecore: sorts run on SparseCore as
+# async calls that TensorCore work can overlap. In the DeepSeek-V4.1 decode
+# step the indexer's two s32[16,4096] candidate sorts (22 us each on the
+# TensorCore) take 10 us each on SparseCore, hidden under the next layers.
+if envs.TPU_SORT_ON_SPARSECORE and not _user_has_flag(
+    "--xla_tpu_enable_offloading_sort_to_sparsecore"
+):
+    _libtpu_extra_args.append("--xla_tpu_enable_offloading_sort_to_sparsecore=true")
+
+# --xla_tpu_enable_async_all_to_all: XLA all-to-alls become start/done pairs
+# that TensorCore work can run between (the DeepSeek-V4.1 HBM Engram lookup's
+# exchanges).
+if envs.TPU_ASYNC_ALL_TO_ALL and not _user_has_flag(
+    "--xla_tpu_enable_async_all_to_all"
+):
+    _libtpu_extra_args.append("--xla_tpu_enable_async_all_to_all=true")
+
 if _libtpu_extra_args:
     _assembled = " ".join(_libtpu_extra_args)
     if _existing_libtpu_args:

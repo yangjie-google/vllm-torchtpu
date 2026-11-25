@@ -678,8 +678,15 @@ def _sorted_union_owners(keys, queries, per_query, blocks):
 def _canonical_candidate_blocks_ref(
     candidates, table, block, width, cache_pages, page_size
 ):
-    """Reference partition into three sorted segments on host XLA."""
+    """Partition each pair into three sorted segments in XLA.
+
+    Sorting (block, query) keys puts each block's entries side by side, query 0
+    first, so neighbour compares find its owners; a second sort orders the
+    blocks by segment.
+    """
     rows, queries, per_query = candidates.shape
+    if queries != 2:
+        raise ValueError("Candidate canonicalization pairs exactly two queries")
     blocks = pl.cdiv(width, block)
     flat = candidates.reshape(rows, queries * per_query)
     physical_block_ids = resolve_candidate_blocks(
@@ -695,17 +702,43 @@ def _canonical_candidate_blocks_ref(
         (physical_block_ids.reshape(*flat.shape, parts) >= 0) | ~needed, axis=-1
     )
     valid &= (flat >= 0) & (flat < blocks)
-    if envs.TPU_DEEPSEEK_V41_CANDIDATE_SORTED_OWNERS and queries <= 30:
-        candidate_block_ids, owners = _sorted_union_owners(
-            jnp.where(valid, flat, blocks), queries, per_query, blocks
+    if not envs.TPU_DEEPSEEK_V41_CANDIDATE_SORTED_OWNERS:
+        query = jnp.arange(flat.shape[1], dtype=flat.dtype) // per_query
+        keys = jnp.sort(jnp.where(valid, flat * 2 + query, 2 * blocks), axis=-1)
+        ids, second = keys >> 1, (keys & 1) == 1
+        live = ids < blocks
+        first = ids != jnp.pad(ids[:, :-1], ((0, 0), (1, 0)), constant_values=-1)
+        last = ids != jnp.pad(ids[:, 1:], ((0, 0), (0, 1)), constant_values=-1)
+        after_first = second & ~jnp.pad(second[:, :-1], ((0, 0), (1, 0)))
+        # One marker per block: its last entry if only query 0 lists it, its
+        # first entry if only query 1 does, else where its entries switch to
+        # query 1.
+        a_only = live & last & ~second
+        shared = live & ~first & after_first
+        b_only = live & first & second
+        segment = jnp.where(a_only, 0, jnp.where(shared, 1, 2))
+        marked = a_only | shared | b_only
+        order = jnp.sort(
+            jnp.where(marked, segment * blocks + ids, 3 * blocks), axis=-1
         )
-    else:
-        candidate_block_ids, owners = None, None
-        candidate_block_ids = jnp.sort(jnp.where(valid, flat, blocks), axis=-1)
-        unique = jnp.diff(candidate_block_ids, axis=-1, prepend=-1) != 0
-        candidate_block_ids = jnp.sort(
-            jnp.where(unique, candidate_block_ids, blocks), axis=-1
+        candidate_block_ids = jnp.where(order < 3 * blocks, order % blocks, -1)
+        physical_block_ids = resolve_candidate_blocks(
+            candidate_block_ids,
+            table,
+            sparse_block_kv=block,
+            cache_pages=cache_pages,
+            page_size=page_size,
         )
+        counts = jnp.stack(
+            [x.sum(axis=1, dtype=jnp.int32) for x in (a_only, shared, b_only)],
+            axis=1,
+        )
+        return candidate_block_ids, physical_block_ids, counts
+    # Opt-in (TPU_DEEPSEEK_V41_CANDIDATE_SORTED_OWNERS): sorted union with
+    # owner-bit payloads; same result as the default path above.
+    candidate_block_ids, owners = _sorted_union_owners(
+        jnp.where(valid, flat, blocks), queries, per_query, blocks
+    )
     candidate_block_ids = jnp.where(
         candidate_block_ids < blocks, candidate_block_ids, -1
     )
@@ -716,15 +749,6 @@ def _canonical_candidate_blocks_ref(
         cache_pages=cache_pages,
         page_size=page_size,
     )
-    if owners is None:
-        # Pack per-query ownership: bit q set when query q lists the union block.
-        owners = jnp.zeros_like(candidate_block_ids)
-        for query in range(queries):
-            present = (
-                (candidate_block_ids[:, :, None] == candidates[:, query, None, :])
-                & (candidates[:, query, None, :] >= 0)
-            ).any(axis=-1)
-            owners = owners | (present.astype(jnp.int32) << query)
     owners = jnp.where(candidate_block_ids >= 0, owners, 0)
     category = jnp.where(
         owners == 1, 0, jnp.where(owners == 3, 1, jnp.where(owners == 2, 2, 3))
@@ -983,6 +1007,8 @@ def gather_candidate_keys(
     group, buffers = _gather_config(block, layout.page_size, len(banks))
     count = physical_block_ids.size
     per_page = PAGE_RECORDS // block
+    if count % per_page:
+        raise ValueError("Candidate blocks must fill whole packed pages")
     source_per_page = layout.page_size // block
     span = group * PAGE_ROWS
     per_unit = pl.cdiv(count, units * group) * group
@@ -996,6 +1022,9 @@ def gather_candidate_keys(
         * lanes,
     )
     meta_steps = metadata_rows // group
+    # Tiles past `count` hold only padding ids and are never written; a partial
+    # last tile writes its prefix, so the output needs no padded tail to slice.
+    full_tiles, tail = divmod(count, group)
     ids = jnp.pad(
         physical_block_ids.reshape(-1),
         (0, units * per_unit - count),
@@ -1018,7 +1047,7 @@ def gather_candidate_keys(
 
     @pl.kernel(
         out_type=jax.ShapeDtypeStruct(
-            (units * per_unit // per_page * PAGE_ROWS, PAGE_RECORDS), jnp.int32
+            (count // per_page * PAGE_ROWS, PAGE_RECORDS), jnp.int32
         ),
         scratch_types=(
             pltpu.VMEM((meta_steps, group), jnp.int32),
@@ -1159,14 +1188,20 @@ def gather_candidate_keys(
 
         def write(step, wait=False):
             slot = step % buffers
+            tile = destination(step)
 
-            @pl.when(live(step))
-            def transfer():
-                target = out.reshape(-1, block).at[
-                    pl.ds(destination(step) * span, span)
-                ]
-                copy = pltpu.make_async_copy(words.at[slot], target, write_sem.at[slot])
+            def transfer(rows):
+                target = out.reshape(-1, block).at[pl.ds(tile * span, rows)]
+                copy = pltpu.make_async_copy(
+                    words.at[slot, pl.ds(0, rows)], target, write_sem.at[slot]
+                )
                 (copy.wait if wait else copy.start)()
+
+            pl.when(live(step) & (tile < full_tiles))(lambda: transfer(span))
+            if tail:
+                pl.when(live(step) & (tile == full_tiles))(
+                    lambda: transfer(tail * PAGE_ROWS)
+                )
 
         for step in range(min(buffers - 1, steps)):
             pl.when(step < active)(

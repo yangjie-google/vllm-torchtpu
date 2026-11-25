@@ -19,15 +19,18 @@ from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphConfig
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental import decode_preparation
+from vllm_torchtpu.kernels.logits_head import (
+    is_supported_shape as is_supported_logits_head_shape,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_mhc_op import (
     initialize_shifted_mhc,
 )
+from vllm_torchtpu.layers.adapter.fused_moe_ep import mark_split_exchange_moe
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41MoE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
 from ..common.mhc import (
-    collapse,
     flat_collapse,
     initialize_delayed_mhc,
     initialize_flat_collapse,
@@ -51,11 +54,13 @@ from .attention import (
 from .attention_kernels import initialize_paged_attention
 from .cache import initialize_cache_ops
 from .ced import (
-    coordinate_decoder_replay,
+    decoder_buckets,
     plan_decoder_replay,
     prefix_replay_enabled,
+    start_decoder_replay_coordination,
 )
-from .engram import Engram, NgramHashState, engram_cache_slots
+from .dspark_sampling import initialize_logits_head
+from .engram import Engram, NgramHashState, engram_cache_slots, initialize_engram_gate
 from .host_engram import (
     HOST_ENGRAM_KEY,
     HostEngramInputs,
@@ -144,11 +149,129 @@ def _with_window_starts(context, first, positions, reuse=None):
     )
 
 
-def _scatter_decoder_rows(
-    tensor: torch.Tensor, indices: torch.Tensor, total_rows: int
-) -> torch.Tensor:
-    result = tensor.new_zeros((total_rows + 1, tensor.shape[-1]))
-    return result.index_copy_(0, indices, tensor)[:-1]
+def _reused(reuse: dict, slot: str, key: tuple, build):
+    """``build()``, or its last result in ``slot`` while ``key`` is unchanged.
+
+    A steady decode batch replays the same plan every step; its small device
+    tensors are uploaded once instead of once per step.
+    """
+    entry = reuse.get(slot)
+    if entry is None or entry[0] != key:
+        entry = (key, build())
+        reuse[slot] = entry
+    return entry[1]
+
+
+def _replay_rows(plan, positions, reuse: dict):
+    """Where each token row's decoder output lands, and the decoder's gather.
+
+    Placement maps a token row to its decoder row, or to the zero row one past
+    the decoder bucket when the decoder skips it. The gather reads padding
+    rows from the last token row.
+    """
+    num_tokens = positions.shape[0]
+
+    def rows():
+        placement = [plan.padded_num_tokens] * num_tokens
+        for decoder_row, row in enumerate(plan.indices):
+            placement[row] = decoder_row
+        padding = plan.padded_num_tokens - len(plan.indices)
+        gather = plan.indices + (num_tokens - 1,) * padding
+        return tuple(
+            torch.tensor(rows, dtype=torch.int64, device=positions.device)
+            for rows in (placement, gather)
+        )
+
+    key = (plan.indices, plan.padded_num_tokens, num_tokens, positions.device)
+    return _reused(reuse, "rows", key, rows)
+
+
+def _replay_bounds(plan, positions, reuse: dict):
+    """The decoder's query bounds, replay starts and padding mask."""
+
+    def bounds():
+        device = positions.device
+        kept = len(plan.indices)
+        return (
+            torch.tensor(plan.query_start_loc, dtype=torch.int32, device=device),
+            torch.tensor(plan.replay_starts, dtype=positions.dtype, device=device),
+            torch.tensor(
+                [False] * kept + [True] * (plan.padded_num_tokens - kept),
+                dtype=torch.bool,
+                device=device,
+            ),
+        )
+
+    key = (
+        plan.query_start_loc,
+        plan.replay_starts,
+        plan.padded_num_tokens,
+        len(plan.indices),
+        positions.dtype,
+        positions.device,
+    )
+    return _reused(reuse, "bounds", key, bounds)
+
+
+def _gather_replay_inputs(gather, *tensors):
+    """``tensor[gather]`` for each decoder input; None stays None."""
+    return tuple(
+        None if tensor is None else torch.index_select(tensor, 0, gather)
+        for tensor in tensors
+    )
+
+
+def _place_decoder_rows(placement, *tensors):
+    """Each decoder output back at its token rows, zeros elsewhere.
+
+    Equals scattering the kept rows into a zero tensor, as a gather from the
+    output with one zero row appended: no scatter and no view of a wider
+    buffer.
+    """
+    return tuple(
+        torch.index_select(
+            torch.cat((tensor, tensor.new_zeros((1, tensor.shape[-1])))), 0, placement
+        )
+        for tensor in tensors
+    )
+
+
+# The replay glue runs between the compiled stages. Eagerly, torch-tpu's
+# DEFER_AND_FUSE fuses it with its live neighbours into a program per dispatch
+# context, compiled when serving first meets it. As compiled regions it is one
+# program per (token bucket, decoder bucket), which warmup compiles
+# (DeepseekV41Model._precompile_replay_glue).
+_tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+_gather_replay_inputs_compiled = _tpu_compile(_gather_replay_inputs)
+_place_decoder_rows_compiled = _tpu_compile(_place_decoder_rows)
+
+
+def gather_replay_inputs(gather, *tensors):
+    fn = (
+        _gather_replay_inputs_compiled
+        if gather.device.type == "tpu"
+        else _gather_replay_inputs
+    )
+    return fn(gather, *tensors)
+
+
+def place_decoder_rows(placement, *tensors):
+    fn = (
+        _place_decoder_rows_compiled
+        if placement.device.type == "tpu"
+        else _place_decoder_rows
+    )
+    return fn(placement, *tensors)
+
+
+def _stream_view(streams: torch.Tensor, hidden_size: int) -> torch.Tensor:
+    """``[T, hc, D]`` view of HC streams handed between CED stage programs.
+
+    The streams cross a program boundary as ``[T, hc * D]``, the shape the mHC
+    kernels write and read: as a ``[T, hc, D]`` program output XLA lays them
+    out by stream instead, which relays out every hand-off.
+    """
+    return streams.unflatten(1, (-1, hidden_size))
 
 
 def _mean_hc_streams(hidden_states: torch.Tensor) -> torch.Tensor:
@@ -445,6 +568,16 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         return {}
 
     @cached_property
+    def _replay_glue_compiled(self) -> set[tuple]:
+        """Forward signatures whose replay glue warmup compiled."""
+        return set()
+
+    @cached_property
+    def _replay_upload(self) -> dict:
+        """Last decoder replay plan tensors (``_replay_rows``, ``_replay_bounds``)."""
+        return {}
+
+    @cached_property
     def _hash_download(self) -> "EngramHashDownload":
         from ..common.host_transfer import EngramHashDownload
 
@@ -728,7 +861,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     gathered_hashes = step_hashes.for_layer(engram)
                     if (
                         isinstance(engram, Engram)
-                        and engram.embed_tokens.host_offload
+                        and _stages_engram_on_host(layer)
                         and engram.embed_tokens.dp_size == 1
                     ):
                         upload = (
@@ -807,8 +940,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         engrams = [
             layer.engram
             for layer in islice(self.layers, self.start_layer, end)
-            if isinstance(layer.engram, Engram)
-            and layer.engram.embed_tokens.host_offload
+            if isinstance(layer.engram, Engram) and _stages_engram_on_host(layer)
         ]
         # Predicting work must never introduce an unmatched DP collective.
         if not engrams or any(engram.embed_tokens.dp_size != 1 for engram in engrams):
@@ -869,6 +1001,30 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 self._window_starts_upload
                 if envs.TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS
                 else None,
+            )
+        if self._ced_enabled:
+            # The decoder bucket depends only on scheduling metadata: start the
+            # DP agreement now and wait for it after the encoder is enqueued.
+            plan = (
+                plan_decoder_replay(
+                    first,
+                    self._ced_window,
+                    positions.shape[0],
+                    self._ced_compile_sizes,
+                )
+                # pyrefly: ignore[unbound-name]
+                if first is not None
+                else None
+            )
+            finish_plan = (
+                start_decoder_replay_coordination(
+                    plan,
+                    positions.shape[0],
+                    envs.TPU_DEEPSEEK_V41_CED_LOCAL_BUCKET_MAX,
+                )
+                # pyrefly: ignore[unbound-name]
+                if context.dp_metadata is not None
+                else lambda: plan
             )
         offload_engram = self._has_cpu_offloaded_engram()
         if offload_engram:
@@ -948,26 +1104,10 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             encoder_aux = []
         # pyrefly: ignore[unbound-name]
         if context.dp_metadata is not None and hidden.device.type == "tpu":
-            # Host bucket coordination depends only on scheduling metadata.
-            # Enqueue the encoder before Gloo waits for other DP replicas.
+            # Enqueue the encoder before waiting for the other DP replicas.
             synchronize_tensors((hidden, pre_mix, *encoder_aux), wait=False)
-        plan = (
-            plan_decoder_replay(
-                first,
-                self._ced_window,
-                positions.shape[0],
-                self._ced_compile_sizes,
-            )
-            # pyrefly: ignore[unbound-name]
-            if first is not None
-            else None
-        )
-        if context.dp_metadata is not None:
-            plan = coordinate_decoder_replay(
-                plan,
-                positions.shape[0],
-                envs.TPU_DEEPSEEK_V41_CED_LOCAL_BUCKET_MAX,
-            )
+        # pyrefly: ignore[unbound-name]
+        plan = finish_plan()
         if plan is not None and plan.padded_num_tokens == 0:
             # The scheduler ignores logits for incomplete prefills. The
             # encoder has still published every global KV row for this chunk;
@@ -996,7 +1136,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             decoder_hidden, decoder_mix = hidden, pre_mix
             requests = first.seq_lens.shape[0] if first is not None else 1
             replay_starts = positions.new_zeros(requests)
-            indices = None
+            placement = None
             decoder_padding = (
                 torch.arange(positions.shape[0], device=positions.device)
                 >= first.query_start_loc[-1]
@@ -1010,28 +1150,16 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             ):
                 # Every row replays in place (steady decode): gathering and
                 # scattering by the identity only copies rows.
-                indices = None
+                placement = None
                 decoder_positions, decoder_ids = positions, input_ids
                 decoder_hidden, decoder_mix = hidden, pre_mix
             else:
-                # The extra output row absorbs padded scatter writes. Reusing
-                # row zero for padding would overwrite a real request's first
-                # result.
-                indices = torch.tensor(
-                    plan.indices
-                    + (num_tokens,) * (plan.padded_num_tokens - len(plan.indices)),
-                    dtype=torch.int64,
-                    device=positions.device,
+                placement, gather = _replay_rows(plan, positions, self._replay_upload)
+                decoder_positions, decoder_ids, decoder_hidden, decoder_mix = (
+                    gather_replay_inputs(gather, positions, input_ids, hidden, pre_mix)
                 )
-                gather = indices.clamp(max=num_tokens - 1)
-                decoder_positions = positions[gather]
-                decoder_ids = input_ids[gather] if input_ids is not None else None
-                decoder_hidden, decoder_mix = hidden[gather], pre_mix[gather]
-            bounds = torch.tensor(
-                plan.query_start_loc, dtype=torch.int32, device=positions.device
-            )
-            replay_starts = torch.tensor(
-                plan.replay_starts, dtype=positions.dtype, device=positions.device
+            bounds, replay_starts, decoder_padding = _replay_bounds(
+                plan, positions, self._replay_upload
             )
             decoder_metadata = {
                 key: replace(
@@ -1040,9 +1168,6 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 # pyrefly: ignore[unbound-name]
                 for key, value in metadata.items()
             }
-            decoder_padding = torch.arange(
-                plan.padded_num_tokens, device=positions.device
-            ) >= len(plan.indices)
         decoder_context = replace(
             context,
             dp_metadata=(
@@ -1074,6 +1199,10 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             )
         if isinstance(output, (list, tuple)) and len(output) == 1:
             output = output[0]
+        if plan is None and positions.device.type == "tpu":
+            # Warmup's full-bucket forwards compile here; afterwards (idle DP
+            # dummy batches) it is a set lookup.
+            self._precompile_replay_glue(positions, input_ids, hidden, pre_mix, output)
         total_rows = positions.shape[0]
         # An identity plan (every row kept, in order, no padding row) leaves
         # the decoder output in original row order: skip the scatter back.
@@ -1083,7 +1212,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         if identity:
             # Serving evidence that steady decode takes the scatter-free path.
             logger.info_once("CED decoder replay is identity; skip scatter")
-        if indices is None or identity:
+        if placement is None or identity:
             if isinstance(output, (list, tuple)) and len(output) == 2:
                 dec_hidden, dec_aux = output
                 return dec_hidden, [*encoder_aux, *dec_aux]
@@ -1091,23 +1220,48 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 return output, list(encoder_aux)
             return output
         if isinstance(output, (list, tuple)) and len(output) == 2:
-            dec_hidden, dec_aux = output
-            return (
-                _scatter_decoder_rows(dec_hidden, indices, total_rows),
-                [
-                    *encoder_aux,
-                    *[
-                        _scatter_decoder_rows(aux, indices, total_rows)
-                        for aux in dec_aux
-                    ],
-                ],
-            )
+            dec_hidden, *dec_aux = place_decoder_rows(placement, output[0], *output[1])
+            return dec_hidden, [*encoder_aux, *dec_aux]
+        (output,) = place_decoder_rows(placement, output)
         if encoder_aux:
-            return (
-                _scatter_decoder_rows(output, indices, total_rows),
-                list(encoder_aux),
+            return output, list(encoder_aux)
+        return output
+
+    def _precompile_replay_glue(self, positions, input_ids, hidden, pre_mix, output):
+        """Compile the replay gather and placement for every decoder bucket.
+
+        Warmup runs the decoder at the full bucket without a plan, so serving
+        would otherwise compile each (token bucket, decoder bucket) pair of a
+        narrowed replay on first use while every DP rank waits. Runs once per
+        forward signature, on zero tensors shaped like this forward's.
+        """
+        num_tokens = positions.shape[0]
+        outputs = (
+            [output[0], *output[1]]
+            if isinstance(output, (list, tuple)) and len(output) == 2
+            else [output]
+        )
+        # The regions also key on arity and dtypes: a forward whose outputs
+        # differ (aux hidden states set later) compiles its own.
+        key = (
+            num_tokens,
+            input_ids is None,
+            tuple((t.dtype, t.shape[-1]) for t in outputs),
+        )
+        if key in self._replay_glue_compiled:
+            return
+        self._replay_glue_compiled.add(key)
+        inputs = [
+            None if t is None else torch.zeros_like(t)
+            for t in (positions, input_ids, hidden, pre_mix)
+        ]
+        placement = positions.new_zeros(num_tokens, dtype=torch.int64)
+        for rows in decoder_buckets(num_tokens, self._ced_compile_sizes):
+            gather = positions.new_zeros(rows, dtype=torch.int64)
+            gather_replay_inputs(gather, *inputs)
+            place_decoder_rows(
+                placement, *(t.new_zeros((rows, t.shape[-1])) for t in outputs)
             )
-        return _scatter_decoder_rows(output, indices, total_rows)
 
     def _forward_split_encoder(
         self,
@@ -1229,7 +1383,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             start_layer, end_layer = split, self._ced_boundary
         stage_sp = self._stage_uses_sequence_parallel(stage)
         carry_stage = stage in ("encoder_middle", "encoder_tail")
-        if stage == "decoder" or carry_stage:
+        if stage == "decoder":
+            hidden_states = _stream_view(inputs_embeds, self.config.hidden_size)
+        elif carry_stage:
             hidden_states = inputs_embeds
         elif upstream.get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -1287,6 +1443,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             input_ids = upstream.sp_shard(input_ids)
 
         residual, post_mix, res_mix = encoder_carry or (None, None, None)
+        if residual is not None:
+            residual = _stream_view(residual, self.config.hidden_size)
         pre_mix: torch.Tensor | None = encoder_pre_mix
         if stage_sp and pre_mix is not None and not carry_stage:
             # CED decoder replay: encoder rows arrive unsharded.
@@ -1341,7 +1499,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 # this post fused with the Engram injection.
                 assert not aux_hidden_by_layer
                 assert isinstance(hidden_states, torch.Tensor)
-                return hidden_states, residual, post_mix, res_mix, pre_mix
+                assert residual is not None
+                # Streams flat across the program boundary (`_stream_view`).
+                return hidden_states, residual.flatten(1), post_mix, res_mix, pre_mix
             if layer is not None:
                 # The last layer has no successor to fold its post into.
                 hidden_states = post(hidden_states, residual, post_mix, res_mix)
@@ -1359,7 +1519,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 # output. Publish it before the host selects the SWA replay rows.
                 decoder = self.layers[self._ced_boundary]
                 assert pre_mix is not None
-                normalized = decoder.attn_norm(collapse(hidden_states, pre_mix))
+                normalized = decoder.attn_norm(flat_collapse(hidden_states, pre_mix))
                 decoder.attn.write_encoder_global_kv(
                     normalized, positions, sp_sharded=stage_sp
                 )
@@ -1368,6 +1528,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     for layer_id in self.aux_hidden_state_layers
                     if layer_id in aux_hidden_by_layer
                 ]
+                # Streams flat across the program boundary (`_stream_view`).
+                hidden_states = hidden_states.flatten(1)
                 if encoder_aux:
                     return hidden_states, pre_mix, encoder_aux
                 return hidden_states, pre_mix
@@ -1422,6 +1584,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         initialize_shifted_mhc()
         initialize_mhc_post()
         initialize_flat_collapse()
+        initialize_engram_gate()
         initialize_paged_attention()
         with (
             device_hooks(
@@ -1463,6 +1626,13 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             vllm_config, warn_prefix_caching=True, fallback_config=self.config
         )
         self._prefix_replay = prefix_replay_enabled(vllm_config)
+        if self._ced_enabled:
+            # The decoder half's MoE layers split their routing exchange around
+            # the shared expert; in the encoder half the split measured slower.
+            for i in range(max(self._ced_boundary, self.start_layer), self.end_layer):
+                experts = getattr(getattr(self.layers[i], "ffn", None), "experts", None)
+                if experts is not None:
+                    mark_split_exchange_moe(experts)
         self._ced_window = self.layers[self._ced_boundary].attn.window_size
         self._ced_compile_sizes = tuple(
             n
@@ -1598,6 +1768,26 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
             engram.upload_hbm_table()
         return loaded
 
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        weight = self.lm_head.weight
+        processor = self.logits_processor
+        # What the processor would compute: the plain BF16 head, no scale, cap,
+        # or vocab padding. A TP-sharded weight is not a tuned shape.
+        if (
+            self._logits_head is not None
+            and hidden_states.dtype == weight.dtype == torch.bfloat16
+            and processor.head_dtype in (None, torch.bfloat16)
+            and not processor.logits_as_input
+            and processor.scale == 1.0
+            and processor.soft_cap is None
+            and processor.org_vocab_size == weight.shape[0]
+            and is_supported_logits_head_shape(
+                hidden_states.shape[0], tuple(weight.shape)
+            )
+        ):
+            return self._logits_head(hidden_states, weight)
+        return super().compute_logits(hidden_states)
+
     def forward(self, *args, **kwargs):
         # Materialize upstream's persistent history outside the compiled model.
         # Its lazy first-use zeros allocation must not become an operation that
@@ -1655,6 +1845,10 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
         # NVIDIA MXFP8 adapter selected by upstream uses weight_scale instead.
         self.hf_to_vllm_mapper = upstream._make_deepseek_v4_weights_mapper(
             getattr(self.config, "expert_dtype", "fp4"), "weight_scale_inv"
+        )
+        # Registered here: compute_logits runs inside compiled programs.
+        self._logits_head = (
+            initialize_logits_head() if envs.TPU_DEEPSEEK_V41_PALLAS_LOGITS else None
         )
 
 

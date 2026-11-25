@@ -23,6 +23,7 @@ from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
 from vllm_torchtpu.kernels.experimental import decode_preparation
+from vllm_torchtpu.kernels.mla import paged_swa
 from vllm_torchtpu.layers.adapter.linear_common import (
     WEIGHT_FLIPPED_ATTR,
 )
@@ -137,6 +138,17 @@ def _shift_swa_metadata(metadata, records, shift, page_size):
     metadata = torch.cat((metadata[:, :2], pages), dim=1)
     records = torch.where(records >= 0, records + shift, records)
     return metadata, records
+
+
+def _cached_swa_publish_plan(stage_cache, records):
+    """(plan, group) of a cached CSA2 write-record tensor, built once per
+    stage: every layer sharing ``records`` differs only by a page shift."""
+    plans = [] if stage_cache is None else stage_cache.setdefault("csa2_swa_plan", [])
+    plan = next((p for r, p in plans if r is records), None)
+    if plan is None:
+        plan = (csa2_adapter.swa_publish_plan_for(records[None]), 0)
+        plans.append((records, plan))
+    return plan
 
 
 def _swa_group_tables(metadata, shape):
@@ -567,6 +579,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     # once the KV cache is bound (`bind_compressor_layout`).
     _compressor_layout_fields: tuple[int, ...] | None = None
     _swa_query_group_size = 1
+    # Fetch the RoPE rows on SparseCore (`_rope_rows`). That pays only beside
+    # independent TensorCore work; at a stage program's entry the first layer
+    # consumes the rows at once, so the target layers gather on the TensorCore.
+    rope_rows_on_sparse_core = False
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads):
@@ -797,8 +813,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             return cached[2]
         # Set at load (runner.utils.relayout_rope_tables) for 64-wide tables.
         pairs = getattr(self, "_tpu_rope_pairs", None)
-        if pairs is not None:
+        if pairs is not None and self.rope_rows_on_sparse_core:
             rows = preprocess_ops.rope_paired_rows_sc()(pairs, positions)
+        elif pairs is not None:
+            rows = preprocess_ops.rope_paired_rows()(pairs, positions)
         else:
             rows = preprocess_ops.rope_rows()(table, positions)
         if stage_cache is not None:
@@ -1230,6 +1248,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         )
         csa2_metadata = csa2_bounds = csa2_write_records = None
         swa_published = False
+        swa_plan_records, swa_shift = None, 0
         if self._csa2:
             if not isinstance(swa_cache, PagedCacheRows):
                 raise ValueError("CSA2 requires a native shared word-row cache")
@@ -1271,8 +1290,15 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         swa_cache,
                         non_causal,
                     )
+                    group_records = [records[g] for g in range(len(tables))]
+                    if records.shape[1] <= paged_swa.SWA_PLAN_MAX_TOKENS:
+                        # One plan program for every group's records, too.
+                        plan = csa2_adapter.swa_publish_plan_for(records)
+                        stage_cache.setdefault("csa2_swa_plan", []).extend(
+                            (r, (plan, g)) for g, r in enumerate(group_records)
+                        )
                     entries.extend(
-                        (table, 0, batched[g], bounds, records[g])
+                        (table, 0, batched[g], bounds, group_records[g])
                         for g, table in enumerate(tables)
                     )
                     cached = next(e for e in entries if e[0] is swa.block_tables)
@@ -1317,13 +1343,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         csa2_write_records,
                     )
                 )
+                swa_plan_records = csa2_write_records
             else:
-                _, offset, csa2_metadata, csa2_bounds, csa2_write_records = cached
+                _, offset, csa2_metadata, csa2_bounds, swa_plan_records = cached
+                swa_shift = swa_cache.row_offset - offset
                 csa2_metadata, csa2_write_records = _shift_swa_metadata(
-                    csa2_metadata,
-                    csa2_write_records,
-                    swa_cache.row_offset - offset,
-                    rows_per_page,
+                    csa2_metadata, swa_plan_records, swa_shift, rows_per_page
                 )
             swa_valid = csa2_write_records >= 0
             swa_invalid_3d = (~swa_valid)[:, None, None]
@@ -1567,7 +1592,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         if self._fused_preprocess:
             # Shares the step's gathered rows with the Q-A/KV kernel.
             q = preprocess_ops.qb_rope()(
-                qr, self.wq_b.weight, self.wq_b.weight_scale, self._rope_rows(positions)
+                qr,
+                self.wq_b.weight,
+                self.wq_b.weight_scale,
+                self._wq_b_head,
+                self._rope_rows(positions),
             )
         else:
             # V4.1 normalizes qr before projection; neither route renormalizes q.
@@ -1594,7 +1623,17 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             kv = self._rotate(kv, positions)
         if self._csa2:
             assert csa2_write_records is not None
-            if not swa_published:
+            planned = csa2_write_records.shape[0] <= paged_swa.SWA_PLAN_MAX_TOKENS
+            if not swa_published and planned:
+                assert swa_plan_records is not None
+                csa2_adapter.publish_swa_planned(
+                    swa_cache,
+                    csa2_write_records,
+                    kv.reshape(-1, 512),
+                    _cached_swa_publish_plan(stage_cache, swa_plan_records),
+                    swa_shift,
+                )
+            elif not swa_published:
                 csa2_adapter.publish_swa(
                     swa_cache, csa2_write_records, kv.reshape(-1, 512)
                 )
@@ -1999,9 +2038,15 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         if self._fused_preprocess:
             self._flip_compressor_weight()
             self._check_fused_weights()
+            # A copy: rebuilt here whenever wq_b is (re)loaded.
+            head = preprocess_ops.qb_rope_head(self.wq_b.weight)
+            if head.device.type == "tpu":
+                synchronize_tensors([head])
+            self.register_buffer("_wq_b_head", head, persistent=False)
             # Register before TorchDynamo captures the first model forward.
             eps = self.kv_norm.variance_epsilon
             preprocess_ops.rope_rows()
+            preprocess_ops.rope_paired_rows()
             preprocess_ops.rope_paired_rows_sc()
             preprocess_ops.qa_rope(True, eps)
             preprocess_ops.qa_rope(False, eps)  # DSpark context KV

@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_INT32_SLOT_WRITE: bool = True
     TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER: bool = True
     TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP: bool = True
+    TPU_DEEPSEEK_V41_ENGRAM_PALLAS_GATE: bool = True
     TPU_DEEPSEEK_V41_IMPL: str = "v2"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_SHM_SHARE_KEY: str = ""
@@ -28,10 +29,12 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS: bool = True
     TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = True
     TPU_DEEPSEEK_V41_MHC_EARLY_PREP: bool = True
+    TPU_DEEPSEEK_V41_MHC_FUSED_GATES: bool = True
     TPU_DEEPSEEK_V41_MHC_SHIFTED_T16: bool = True
     TPU_DEEPSEEK_V41_MHC_PAD_SMALL_T: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_ASYNC_DEVICE_HASH: bool = False
     TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS: bool = True
+    TPU_DEEPSEEK_V41_PALLAS_LOGITS: bool = True
     TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
     TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS: bool = True
     TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER: bool = True
@@ -39,6 +42,8 @@ if TYPE_CHECKING:
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_ONEHOT_TABLE_LOOKUP: bool = True
     TPU_INLINE_DEDUPLICATED_CALLS: bool = True
+    TPU_SORT_ON_SPARSECORE: bool = True
+    TPU_ASYNC_ALL_TO_ALL: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
     TPU_ROPE_PAIRED_ROWS: bool = True
     TPU_BLOCK_TABLE_DELTA_BUCKETS: bool = True
@@ -134,9 +139,15 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_PUSH_EXCHANGE_TABLES: bool = True
     MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES: bool = True
     MOE_FUSED_EP_PUSH_SHARED_EXPERT: bool = True
+    MOE_FUSED_EP_PUSH_SHARED_ADD: bool = True
     MOE_FUSED_EP_PUSH_LIGHT_PREPUSH: int = 2
     MOE_FUSED_EP_PUSH_SINGLE_BARRIER: bool = True
+    MOE_FUSED_EP_PUSH_SPLIT_EXCHANGE: bool = True
     MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER: int = 2
+    MOE_FUSED_EP_PUSH_ONEHOT_SCALE_SLAB: bool = True
+    MOE_FUSED_EP_PUSH_PAIR_KERNEL: bool = True
+    MOE_FUSED_EP_PUSH_WIDE_PAIR_KERNEL: bool = True
+    MOE_FUSED_EP_PUSH_DECODE_COMBINE: bool = True
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
@@ -222,7 +233,7 @@ if TYPE_CHECKING:
     VLLM_TPU_DP_PROMPT_BACKLOG_MARGIN: float = 1.0
     VLLM_TPU_DP_PREFIX_AFFINITY: bool = False
     VLLM_TPU_DP_PREFIX_AFFINITY_CHUNK_TOKENS: int = 4096
-    VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN: int = 2
+    VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN: int = 8
     VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE: int = 65536
 
 
@@ -541,6 +552,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP": env_bool(
         "TPU_DEEPSEEK_V41_ENGRAM_FUSED_PREP", default=True
     ),
+    # Gate the Engram value into the hc streams with one Pallas pass
+    # (kernels/deepseek_v41/engram_gate.py) instead of XLA's FP32 [T, M, D]
+    # passes; outputs can differ by one BF16 rounding step.
+    "TPU_DEEPSEEK_V41_ENGRAM_PALLAS_GATE": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_PALLAS_GATE", default=True
+    ),
     # Deprecated aliases, resolved by the DSV41 serving-policy verifier.
     # v1 was removed; the verifier rejects it with a clear message.
     "TPU_DEEPSEEK_V41_IMPL": env_with_choices(
@@ -564,16 +581,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DEEPSEEK_V41_ENGRAM_SHM_SHARE_KEY": env_str(
         "TPU_DEEPSEEK_V41_ENGRAM_SHM_SHARE_KEY", default=""
     ),
-    # With Engram CPU offload and head-sharded host tables (dp_shared_memory
-    # off, or its /dev/shm fallback), serve Engram layers from an HBM copy of
-    # each rank's host head shard, looked up on device across the node-local
-    # DP group (common/engram_hbm.py), instead of the per-step host gather and
-    # gloo exchange. DP-shared host tables need no exchange and keep the host
-    # path. "first": only the first Engram layer (layer 1, which only layer 0
-    # can hide; later layers keep the host path, overlapped with the layers
-    # before them); "all": every Engram layer; "off": keep all layers on the
-    # host path; "auto" (default): "first" when the EP group has >= 16 ranks,
-    # else "off". Each HBM layer costs ~11.8 GiB per rank at 8 ranks per node.
+    # With Engram CPU offload over a node-local DP group (head-sharded or
+    # DP-shared host tables), serve Engram layers from an HBM copy of each
+    # rank's head shard, looked up on device across the group
+    # (common/engram_hbm.py), instead of the per-step hash D2H, host gather
+    # (and gloo exchange) and H2D. "first": only the first Engram layer
+    # (layer 1, which only layer 0 can hide; later layers keep the host path,
+    # overlapped with the layers before them); "all": every Engram layer;
+    # "off": keep all layers on the host path; "auto" (default): "first" when
+    # the EP group has >= 16 ranks and the host tables are head-sharded, else
+    # "off". Each HBM layer costs ~11.8 GiB per rank at 8 ranks per node.
     "TPU_DEEPSEEK_V41_ENGRAM_HBM": env_with_choices(
         "TPU_DEEPSEEK_V41_ENGRAM_HBM",
         "auto",
@@ -615,6 +632,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DEEPSEEK_V41_MHC_EARLY_PREP": env_bool(
         "TPU_DEEPSEEK_V41_MHC_EARLY_PREP", default=True
     ),
+    # Shifted mHC: compute the next layer's gates inside the seam kernel (no
+    # second gate kernel); the next seam reads them from HBM, so they are not
+    # copied back into VMEM ahead of it. Takes precedence over RESIDENT_GATES.
+    # Outputs are unchanged.
+    "TPU_DEEPSEEK_V41_MHC_FUSED_GATES": env_bool(
+        "TPU_DEEPSEEK_V41_MHC_FUSED_GATES", default=True
+    ),
     # Shifted mHC: also run token counts that are a multiple of 16 but not 32
     # (the DSpark drafter's 240 rows) through the fused kernel, with 16-token
     # mix groups, instead of the unfused post + delayed-pre fallback. Changes
@@ -644,6 +668,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Changes only the draft logits' rounding (FP32 accumulation order).
     "TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS": env_bool(
         "TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS", default=True
+    ),
+    # Target model logits: compute the LM head with the same Pallas full-K head
+    # at the row counts in its TUNED_TILES instead of the XLA dot. Changes only
+    # the logits' rounding (FP32 accumulation order).
+    "TPU_DEEPSEEK_V41_PALLAS_LOGITS": env_bool(
+        "TPU_DEEPSEEK_V41_PALLAS_LOGITS", default=True
     ),
     # Gather RoPE table rows (attention preprocessing, CSA2 inverse RoPE) as
     # 256-row gathers when a step has 257..1024 rows
@@ -682,6 +712,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_INLINE_DEDUPLICATED_CALLS": env_bool(
         "TPU_INLINE_DEDUPLICATED_CALLS", default=True
     ),
+    # Let XLA run sorts on SparseCore, asynchronously beside TensorCore work
+    # (--xla_tpu_enable_offloading_sort_to_sparsecore; env_override.py). Same
+    # results; the DeepSeek-V4.1 indexer's per-step candidate sorts leave the
+    # TensorCore's critical path. Measured on DeepSeek-V4.1 (tpu7x) only; set
+    # 0 if another model's sorts contend for SparseCore.
+    "TPU_SORT_ON_SPARSECORE": env_bool("TPU_SORT_ON_SPARSECORE", default=True),
+    # Issue XLA all-to-alls asynchronously, so TensorCore work overlaps them
+    # (--xla_tpu_enable_async_all_to_all; env_override.py). Same results; the
+    # DeepSeek-V4.1 HBM Engram lookup's exchanges leave the critical path.
+    # Measured on DeepSeek-V4.1 (tpu7x) only; buffers stay live across the
+    # overlapped work, so set 0 if another model's peak memory or step regresses.
+    "TPU_ASYNC_ALL_TO_ALL": env_bool("TPU_ASYNC_ALL_TO_ALL", default=True),
     # Debug: on every incremental step, rebuild the full packed table on the
     # host and check it against the device-resident copy (raises on mismatch).
     "TPU_VERIFY_INCREMENTAL_BLOCK_TABLE": env_bool(
@@ -1143,6 +1185,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_PUSH_SINGLE_BARRIER": env_bool(
         "MOE_FUSED_EP_PUSH_SINGLE_BARRIER", default=True
     ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push with EXCHANGE_TABLES and the in-op shared
+    # expert, on layers the model tags (mark_split_exchange_moe): the routing
+    # exchange is issued and waited in two calls, with the shared expert's
+    # gate_up projection between them.
+    "MOE_FUSED_EP_PUSH_SPLIT_EXCHANGE": env_bool(
+        "MOE_FUSED_EP_PUSH_SPLIT_EXCHANGE", default=True
+    ),
     # MOE_FUSED_EP_KERNEL_IMPL=push with the in-op shared expert: the
     # activation scale-slab scatter (a SparseCore offload) is not held behind
     # the shared expert (1), nor behind the SparseCore pre-push (2), so it can
@@ -1150,12 +1199,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER": env_int(
         "MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER", 2
     ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: a decode-sized step builds the activation
+    # scale slab with a one-hot matmul on the TensorCore instead of a
+    # SparseCore scatter, which the pre-push otherwise queues behind.
+    "MOE_FUSED_EP_PUSH_ONEHOT_SCALE_SLAB": env_bool(
+        "MOE_FUSED_EP_PUSH_ONEHOT_SCALE_SLAB", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push with EXCHANGE_TABLES and KERNEL_PLAN_TABLES:
+    # a decode-sized step's per-pair plan tables and activation scale slab come
+    # from one kernel over the exchanged payload instead of ~30 XLA ops.
+    "MOE_FUSED_EP_PUSH_PAIR_KERNEL": env_bool(
+        "MOE_FUSED_EP_PUSH_PAIR_KERNEL", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push with EXCHANGE_TABLES and KERNEL_PLAN_TABLES:
+    # a prefill-sized step's per-pair plan tables and local expert sort come
+    # from two kernels instead of ~60 XLA ops and an argsort.
+    "MOE_FUSED_EP_PUSH_WIDE_PAIR_KERNEL": env_bool(
+        "MOE_FUSED_EP_PUSH_WIDE_PAIR_KERNEL", default=True
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=push: a step of at most 64 tokens a shard combines
+    # its arrivals with the one-pass decode kernel instead of XLA's epilogue.
+    "MOE_FUSED_EP_PUSH_DECODE_COMBINE": env_bool(
+        "MOE_FUSED_EP_PUSH_DECODE_COMBINE", default=True
+    ),
     # MOE_FUSED_EP_KERNEL_IMPL=push: run the layer's FP8 shared expert as one
     # kernel (kernels/quantized_matmul/shared_expert.py) inside the MoE op,
     # issued after the SparseCore pre-push and ahead of the expert kernel, so
     # the TensorCore computes it while the pre-push is in flight.
     "MOE_FUSED_EP_PUSH_SHARED_EXPERT": env_bool(
         "MOE_FUSED_EP_PUSH_SHARED_EXPERT", default=True
+    ),
+    # With MOE_FUSED_EP_PUSH_SHARED_EXPERT: the op also applies the MoE
+    # runner's routed scale and adds the shared expert's output inside the
+    # combine kernel, so it returns the layer's one output and the runner's
+    # separate scale-and-add pass over it is gone.
+    "MOE_FUSED_EP_PUSH_SHARED_ADD": env_bool(
+        "MOE_FUSED_EP_PUSH_SHARED_ADD", default=True
     ),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
@@ -1383,6 +1462,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # API server: tokenize chat prompts piecewise between added tokens and
     # cache message-body pieces across turns (segment_tokenize.py). Exact;
     # falls back to full tokenization for ineligible tokenizers/requests.
+    # The id lists it produces skip vLLM's vocabulary validation.
     "VLLM_TPU_SEGMENT_TOKENIZE": env_bool("VLLM_TPU_SEGMENT_TOKENIZE"),
     # Token budget of that cache (~12 B/token: id pointers plus piece text).
     "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS": env_nonnegative_int(
@@ -1443,7 +1523,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Data-parallel front end: send a request to the least loaded engine that
     # took its longest remembered prompt prefix (core/dp_prefix_affinity.py),
     # so that engine's prefix cache serves it, unless that engine is more than
-    # LOAD_MARGIN requests busier than the least loaded one.
+    # LOAD_MARGIN requests busier than the least loaded one. Leaving the holder
+    # recomputes the whole conversation on another engine, while a few more
+    # requests in flight cost the holder little, so the default (8) tolerates
+    # several requests of imbalance before it gives up the prefix cache.
     "VLLM_TPU_DP_PREFIX_AFFINITY": env_bool(
         "VLLM_TPU_DP_PREFIX_AFFINITY", default=False
     ),
@@ -1451,7 +1534,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_TPU_DP_PREFIX_AFFINITY_CHUNK_TOKENS", 4096
     ),
     "VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN": env_nonnegative_int(
-        "VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN", 2
+        "VLLM_TPU_DP_PREFIX_AFFINITY_LOAD_MARGIN", 8
     ),
     "VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE": env_positive_int(
         "VLLM_TPU_DP_PREFIX_AFFINITY_TABLE_SIZE", 65536

@@ -81,30 +81,46 @@ class Radix:
         prefix, remaining, total, count = self.pivot(jnp.int32(quota))
         keep_all = total <= quota
         done = keep_all | (remaining == count)
-        remaining_bits = jnp.int32(FP32_BITS - RADIX_BITS)
-        for shift in reversed(range(0, FP32_BITS - RADIX_BITS, RADIX_BITS)):
+
+        # A loop, not unrolled: each copy of the refinement adds program
+        # that the SparseCore loads on every call.
+        def refine_byte(step, state):
+            prefix, remaining, remaining_bits, done = state
+            shift = FP32_BITS - 2 * RADIX_BITS - step * RADIX_BITS
+            # Unsigned, so the key shifts stay logical.
+            low = shift.astype(jnp.uint32)
             self.clear()
 
             @plsc.parallel_loop(0, jnp.where(done, 0, chunks), unroll=8)
-            def refine(i, shift=shift, prefix=prefix):
+            def refine(i):
                 bits = values[pl.ds(i * lanes, lanes)].view(jnp.uint32)
-                match = (bits >> (shift + RADIX_BITS)) == prefix.astype(jnp.uint32)
-                digits = ((bits >> shift) & RADIX_MASK).astype(jnp.int32)
+                match = (bits >> (low + RADIX_BITS)) == prefix.astype(jnp.uint32)
+                digits = ((bits >> low) & RADIX_MASK).astype(jnp.int32)
                 counts, last = plsc.scan_count(digits, mask=match)
                 plsc.addupdate_scatter(self.histogram, [digits], counts, mask=last)
 
             bucket, next_remaining, _, count = self.pivot(remaining)
-            prefix = jnp.where(done, prefix, (prefix << RADIX_BITS) | bucket)
             remaining = jnp.where(done, remaining, next_remaining)
-            remaining_bits = jnp.where(done, remaining_bits, shift)
-            done |= remaining == count
+            return (
+                jnp.where(done, prefix, (prefix << RADIX_BITS) | bucket),
+                remaining,
+                jnp.where(done, remaining_bits, shift),
+                done | (remaining == count),
+            )
+
+        state = (prefix, remaining, jnp.int32(FP32_BITS - RADIX_BITS), done)
+        steps = (FP32_BITS - RADIX_BITS) // RADIX_BITS
+        prefix, remaining, remaining_bits, done = jax.lax.fori_loop(
+            0, steps, refine_byte, state
+        )
         lower = prefix.astype(jnp.uint32) << remaining_bits.astype(jnp.uint32)
         floor = jnp.uint32(ORDERED_NEG_INF + 1)
         gate = jnp.where(keep_all, floor, jnp.maximum(lower, floor))
         return total, lower, gate, remaining, done
 
-    def emit(self, values, chunks, quota, selection, destination, ids=None):
-        """Write `ids(i)` (default: positions) of the selected keys, -1 after."""
+    def emit(self, values, chunks, quota, selection, destination, ids=None, offset=0):
+        """Write `ids(i)` (default: positions) of the selected keys, -1 after,
+        from `destination[offset]` on."""
         lanes, ids = self.lanes, ids or self.positions
         total, lower, gate, remaining, done = selection
 
@@ -112,11 +128,12 @@ class Radix:
             jnp.minimum(total // lanes * lanes, quota), quota, lanes, unroll=4
         )
         def initialize(i):
-            destination[pl.ds(i, lanes)] = jnp.full(lanes, -1, jnp.int32)
+            destination[pl.ds(offset + i, lanes)] = jnp.full(lanes, -1, jnp.int32)
 
         def store(i, count, selected):
             ranks = plsc.cumsum(selected.astype(jnp.int32))
-            plsc.store_scatter(destination, [count + ranks - 1], ids(i), mask=selected)
+            slots = offset + count + ranks - 1
+            plsc.store_scatter(destination, [slots], ids(i), mask=selected)
             return count + plsc.all_reduce_population_count(selected)
 
         @plsc.parallel_loop(
@@ -211,6 +228,21 @@ def _untuned_block_max_config(scores, lengths, block_size):
     return rows, 1024
 
 
+def visible_block_scores(
+    maxima: jax.Array, lengths: jax.Array, *, block_size: int
+) -> jax.Array:
+    """`candidate_block_scores` from the scores' block maxima.
+
+    Blocks at or past each row's length may hold anything; they become -inf,
+    and the newest visible block is forced to win.
+    """
+    lengths = jnp.clip(lengths, 0, maxima.shape[1] * block_size)
+    blocks = jnp.arange(maxima.shape[1])[None, :]
+    live = pl.cdiv(lengths, block_size)[:, None]
+    visible = jnp.where(blocks < live, maxima, -jnp.inf)
+    return jnp.where(blocks == live - 1, jnp.inf, visible)
+
+
 def _candidate_block_scores(scores, lengths, block_size, config):
     rows, width = scores.shape
     row_tile, block_tile = config
@@ -218,28 +250,47 @@ def _candidate_block_scores(scores, lengths, block_size, config):
     blocks = pl.cdiv(width, block_size)
     padded_blocks = pl.cdiv(blocks, block_tile) * block_tile
     token_tile = block_tile * block_size
+    # The last input window holding a visible column, per row tile: later
+    # windows repeat its block index, so the pipeline fetches nothing for them.
+    longest = lengths.reshape(rows // row_tile, row_tile).max(axis=1)
+    last_window = jnp.maximum(longest - 1, 0) // token_tile
 
-    def kernel(length_ref, score_ref, out_ref):
-        start = pl.program_id(1) * block_tile
-        limits = jnp.stack(
-            [length_ref[pl.program_id(0) * row_tile + i] for i in range(row_tile)]
-        )
-        columns = jnp.arange(token_tile) + start * block_size
-        values = jnp.where(columns[None, :] < limits[:, None], score_ref[...], -jnp.inf)
-        vectors = values.reshape(row_tile, token_tile // lanes, lanes)
-        # Each lane ending a block receives its maximum; gather those lanes
-        # without expanding the block axis into padded vectors.
-        for bit in range(block_size.bit_length() - 1):
-            vectors = jnp.maximum(vectors, pltpu.roll(vectors, 1 << bit, axis=2))
-        indices = jnp.arange(lanes // block_size) * block_size + block_size - 1
-        indices = jnp.broadcast_to(indices, (*vectors.shape[:-1], indices.size))
-        reduced = jnp.take_along_axis(vectors, indices, axis=2).reshape(
-            row_tile, block_tile
-        )
-        last = (limits - 1) // block_size
-        out_ref[...] = jnp.where(
-            jnp.arange(block_tile)[None, :] + start == last[:, None], jnp.inf, reduced
-        )
+    def kernel(length_ref, last_ref, score_ref, out_ref):
+        window = pl.program_id(1)
+        start = window * block_tile
+
+        @pl.when(window <= last_ref[pl.program_id(0)])
+        def reduce():
+            limits = jnp.stack(
+                [length_ref[pl.program_id(0) * row_tile + i] for i in range(row_tile)]
+            )
+            columns = jnp.arange(token_tile) + start * block_size
+            values = jnp.where(
+                columns[None, :] < limits[:, None], score_ref[...], -jnp.inf
+            )
+            vectors = values.reshape(row_tile, token_tile // lanes, lanes)
+            # Each lane ending a block receives its maximum; gather those lanes
+            # without expanding the block axis into padded vectors.
+            for bit in range(block_size.bit_length() - 1):
+                vectors = jnp.maximum(vectors, pltpu.roll(vectors, 1 << bit, axis=2))
+            indices = jnp.arange(lanes // block_size) * block_size + block_size - 1
+            indices = jnp.broadcast_to(indices, (*vectors.shape[:-1], indices.size))
+            reduced = jnp.take_along_axis(vectors, indices, axis=2).reshape(
+                row_tile, block_tile
+            )
+            last = (limits - 1) // block_size
+            out_ref[...] = jnp.where(
+                jnp.arange(block_tile)[None, :] + start == last[:, None],
+                jnp.inf,
+                reduced,
+            )
+
+        @pl.when(window > last_ref[pl.program_id(0)])
+        def invisible():
+            out_ref[...] = jnp.full(out_ref.shape, -jnp.inf, out_ref.dtype)
+
+    def score_window(i, j, _, last_ref):
+        return i, jnp.minimum(j, last_ref[i])
 
     # The final input window can be partial. Its invisible columns are masked
     # in the kernel, avoiding a full score-buffer copy to pad the DMA tile.
@@ -247,16 +298,16 @@ def _candidate_block_scores(scores, lengths, block_size, config):
         kernel,
         out_shape=jax.ShapeDtypeStruct((rows, padded_blocks), scores.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
+            num_scalar_prefetch=2,
             grid=(rows // row_tile, padded_blocks // block_tile),
-            in_specs=(pl.BlockSpec((row_tile, token_tile), lambda i, j, _: (i, j)),),
-            out_specs=pl.BlockSpec((row_tile, block_tile), lambda i, j, _: (i, j)),
+            in_specs=(pl.BlockSpec((row_tile, token_tile), score_window),),
+            out_specs=pl.BlockSpec((row_tile, block_tile), lambda i, j, *_: (i, j)),
         ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel")
         ),
         name="indexer_candidate_block_max",
-    )(lengths, scores)
+    )(lengths, last_window, scores)
     return result[:, :blocks]
 
 

@@ -21,14 +21,15 @@ class _UniformTiles:
 
 
 def _fill_query_tiles(starts, tiles, total_tokens, bq):
+    """Tile the request rows; padding rows from starts[B] onward get no tile."""
     batch = starts.shape[0] - 1
+    padding = _padding_start(starts, total_tokens)
 
-    def request_body(request, first):
-        begin = starts[request]
-        end = jnp.where(
-            request == batch, total_tokens, starts[jnp.minimum(request + 1, batch)]
-        )
-        count = pl.cdiv(end - begin, bq)
+    def request_body(carry):
+        request, first, begin = carry
+        following = starts[request + 1]
+        end = jnp.minimum(following, padding)
+        count = pl.cdiv(jnp.maximum(end - begin, 0), bq)
 
         def tile_body(local, unused):
             offset = begin + local * bq
@@ -39,10 +40,22 @@ def _fill_query_tiles(starts, tiles, total_tokens, bq):
             return None
 
         lax.fori_loop(0, count, tile_body, None)
-        return first + count
+        return request + 1, first + count, following
 
-    # A final synthetic request covers output padding without an HBM clear pass.
-    return lax.fori_loop(0, batch + 1, request_body, jnp.int32(0))
+    # Boundaries never decrease, so the requests after the first one that
+    # starts at the padding are empty: a decode bucket's unused slots cost
+    # no loop iterations.
+    _, count, _ = lax.while_loop(
+        lambda carry: (carry[0] < batch) & (carry[2] < padding),
+        request_body,
+        (jnp.int32(0), jnp.int32(0), starts[0]),
+    )
+    return count
+
+
+def _padding_start(starts, total_tokens):
+    # Rows past the bucket are never tiled or zeroed, whatever starts[B] holds.
+    return jnp.clip(starts[starts.shape[0] - 1], 0, total_tokens)
 
 
 def build_query_tiles(
@@ -148,7 +161,9 @@ def _csa2_kernel_impl(
 
     Output rows land at query_offset onward. With ``owners`` "new" or
     "aliased", the main KV rows are also copied to the matching rows of the
-    [T', 512, 128] output, which "aliased" updates in place.
+    [T', 512, 128] output, which "aliased" updates in place. Padding rows
+    (from starts[B] on) are zeroed in the attention output and unspecified in
+    the KV output.
     """
     if owners == "aliased":
         _, _, out_hbm, kv_out_hbm, *scratch = refs
@@ -177,6 +192,8 @@ def _csa2_kernel_impl(
         output_sems,
         kv_sem,
         tile_scratch,
+        zeros,  # [bq, H, 512], BF16; None with fixed tiles
+        padding_sem,
     ) = scratch
     tokens, heads = positions_ref.shape[0], q_hbm.shape[1]
     bq = q_buf.shape[1]
@@ -206,9 +223,50 @@ def _csa2_kernel_impl(
         lax.fori_loop(0, count, tile_body, None)
     else:
         count = _fill_query_tiles(plan_ref, tiles_ref, tokens, bq)
-        if bq == 1:
-            count = tokens
     mxu_heads = pl.cdiv(heads, 16) * 16
+
+    # Rows from starts[B] are output padding: zero them with DMAs instead of
+    # running them through query tiles.
+    padding = tokens if fixed_tiles else _padding_start(plan_ref, tokens)
+    if not fixed_tiles:
+        # A call without request rows still runs one tile, of padding rows
+        # (request B, masked to zero), so the tile pipeline below stays
+        # unconditional.
+        empty = count == 0
+
+        @pl.when(empty)
+        def _():
+            tiles_ref[0] = batch
+            tiles_ref[1] = 0
+            tiles_ref[2] = min(bq, tokens)
+
+        padding = jnp.where(empty, min(bq, tokens), padding)
+        count = jnp.maximum(count, 1)
+    padding_tiles = pl.cdiv(tokens - padding, bq)
+
+    def padding_copy(index):
+        start = padding + index * bq
+        size = jnp.minimum(bq, tokens - start)
+        return pltpu.make_async_copy(
+            zeros.at[pl.ds(0, size)],
+            out_hbm.at[pl.ds(query_offset + start, size)],
+            padding_sem.at[0],
+        )
+
+    def start_padding():
+        if fixed_tiles:
+            return
+
+        @pl.when(padding_tiles > 0)
+        def _():
+            zeros[...] = jnp.zeros(zeros.shape, zeros.dtype)
+
+        lax.fori_loop(0, padding_tiles, lambda i, _: padding_copy(i).start(), None)
+
+    def wait_padding():
+        if fixed_tiles:
+            return
+        lax.fori_loop(0, padding_tiles, lambda i, _: padding_copy(i).wait(), None)
 
     def safe_tile(tile):
         if isinstance(tile, int):
@@ -355,9 +413,12 @@ def _csa2_kernel_impl(
             )
         for i in range(bq):
             output = pv_raw[i]
+            # PV accumulated unnormalized weights. SWA-only inverses are
+            # already replicated across lanes (see swa_pv_sum).
             if has_main:
-                # PV accumulated unnormalized weights.
                 output = output * inverses[bank, i]
+            else:
+                output = output * jnp.concatenate((inverses[bank, i],) * 4, axis=1)
             tail = output[:, 384:]
             partner = jnp.take_along_axis(
                 tail,
@@ -604,6 +665,35 @@ def _csa2_kernel_impl(
                     if r == bq - 1:
                         preload_next(mxu)
 
+        def swa_pv_sum(indices):
+            # SWA-only PV with unnormalized weights. Before its PV, mxu1 sums
+            # each row's weights against ones into the row's QK accumulator,
+            # free once the scores are popped: the denominator arrives
+            # replicated across lanes, with no cross-lane sum or broadcast.
+            pltpu.matmul_push_rhs(swa_ref[:, pl.ds(0, 256)], 0, 0)
+            pltpu.matmul_push_rhs(jnp.ones((256, 256), jnp.bfloat16), 0, 1)
+            for r, i in enumerate(indices):
+                lhs = jnp.pad(swa_p_ref[i], ((0, mxu_heads - heads), (0, 0)))
+                pltpu.matmul_acc_lhs(
+                    accumulators[0][bq + r], lhs, load_staged_rhs=0 if r == 0 else None
+                )
+                pltpu.matmul_acc_lhs(
+                    accumulators[1][r], lhs, load_staged_rhs=0 if r == 0 else None
+                )
+                if r == 0:
+                    pltpu.matmul_push_rhs(swa_ref[:, pl.ds(256, 256)], 0, 1)
+            preload_next(0)
+            for r, i in enumerate(indices):
+                lhs = jnp.pad(swa_p_ref[i], ((0, mxu_heads - heads), (0, 0)))
+                pltpu.matmul_acc_lhs(
+                    accumulators[1][bq + r], lhs, load_staged_rhs=0 if r == 0 else None
+                )
+            preload_next(1)
+            for r, i in enumerate(indices):
+                total = pltpu.matmul_pop(accumulators[1][r])[:heads, :128]
+                # inverses holds the sink term until the sum arrives.
+                inverses[bank, i] = 1.0 / (inverses[bank, i] + total)
+
         indices = tuple(range(bq))
         if not has_main:
             # SWA-only layers: the window is the whole key set.
@@ -612,19 +702,23 @@ def _csa2_kernel_impl(
             if not first_tile:
                 finish(tile - 1, 1 - bank)
             swa_qk_pop(0, bq)
-            sink = sink_ref[...] * log2_e
+            sink = jnp.broadcast_to(sink_ref[...] * log2_e, (heads, 128))
             for r in indices:
                 swa_logits = swa_score_ref[r]
-                maximum = jnp.maximum(sink, jnp.max(swa_logits, axis=1, keepdims=True))
-                exponentials = jnp.exp2(swa_logits - maximum)
-                denominator = jnp.exp2(sink - maximum) + jnp.sum(
-                    exponentials, axis=1, keepdims=True
+                # One lane broadcast of the maximum serves both halves and
+                # the sink term.
+                maximum = jnp.maximum(
+                    sink,
+                    jnp.broadcast_to(
+                        jnp.max(swa_logits, axis=1, keepdims=True), (heads, 128)
+                    ),
                 )
-                # One reciprocal per row: a per-element divide costs 9 us/call
-                # here (62 vs 71 us); the full form keeps its divide (measured
-                # slower with the reciprocal).
-                swa_p_ref[r] = (exponentials * (1.0 / denominator)).astype(jnp.bfloat16)
-            swa_pv(indices)
+                exponentials = jnp.exp2(
+                    swa_logits - jnp.concatenate((maximum, maximum), axis=1)
+                )
+                inverses[bank, r] = jnp.exp2(sink - maximum)
+                swa_p_ref[r] = exponentials.astype(jnp.bfloat16)
+            swa_pv_sum(indices)
             if not first_tile:
                 output_copy(tile - 1, 1 - bank).start()
             return
@@ -650,6 +744,8 @@ def _csa2_kernel_impl(
         @pl.when(i < count)
         def _(*, i=i):
             start(i, i)
+
+    start_padding()
 
     for copy in (*input_copies(0, 0), *swa_copies(0, 0)):
         copy.wait()
@@ -748,6 +844,8 @@ def _csa2_kernel_impl(
         output_copy(count - 2, (count - 2) % 2).wait()
 
     output_copy(count - 1, (count - 1) % 2).wait()
+
+    wait_padding()
 
 
 def _csa2_kernel(
@@ -850,8 +948,8 @@ def csa2(
     SWA accepts BF16 [pages,tokens,512] or shared INT32 [pages,word_rows,128]
     owners. Four 128-word rows hold a pair of tokens; each word packs the same
     feature from adjacent token rows in its low/high halves. Physical page
-    geometry stays identical to the main word pool. starts [B+1] describes requests;
-    repeated boundaries and output padding are supported.
+    geometry stays identical to the main word pool. starts [B+1] describes requests
+    and never decreases; repeated boundaries and output padding are supported.
     Explicit swa_bounds selects visibility independently of model layer stage.
 
     The T queries are rows [query_offset, query_offset + T) of q [T',H,512].
@@ -860,7 +958,8 @@ def csa2(
     owners and ``(out, kv_out)`` is returned, so a chunked caller needs no
     output update or gathered-KV concatenation. ``new_owners`` instead
     returns two newly allocated owners of those shapes; only this call's rows
-    are written.
+    are written. Padding rows (from starts[B] on) get zero attention and
+    unspecified KV.
 
     ``main_kv=None`` (with ``main_kv_scale=None``) is SWA-only attention, the
     layers whose compress ratio is 0: the window is the whole key set and the
@@ -1062,13 +1161,15 @@ def csa2(
                 pltpu.VMEM((bq, heads, 256), jnp.float32),
                 pltpu.VMEM((bq, heads, 512), jnp.bfloat16) if has_main else None,
                 pltpu.VMEM((bq, heads, 256), jnp.bfloat16),
-                pltpu.VMEM((2, bq, heads, 1), jnp.float32),
+                pltpu.VMEM((2, bq, heads, 1 if has_main else 128), jnp.float32),
                 pltpu.VMEM((bq, heads, 512), jnp.float32),
                 pltpu.SemaphoreType.DMA((4, 2 if resident_metadata else 4)),
                 pltpu.SemaphoreType.DMA((4, num_pages)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((4,)),
                 pltpu.SMEM((tile_capacity * 3,), jnp.int32),
+                None if fixed_tiles else pltpu.VMEM((bq, heads, 512), jnp.bfloat16),
+                pltpu.SemaphoreType.DMA((1,)),
             ),
         ),
         compiler_params=pltpu.CompilerParams(

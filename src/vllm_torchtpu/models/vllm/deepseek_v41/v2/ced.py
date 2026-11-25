@@ -1,5 +1,6 @@
 """Host planning for decoder SWA bounded replay across scheduled chunks."""
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 import torch
@@ -31,10 +32,13 @@ class DecoderReplayPlan:
     padded_num_tokens: int
 
 
-def coordinate_decoder_replay(
+def start_decoder_replay_coordination(
     plan: DecoderReplayPlan | None, num_tokens: int, local_bucket_max: int = 0
-) -> DecoderReplayPlan | None:
-    """Make every EP participant enter the decoder with the same row bucket.
+) -> Callable[[], DecoderReplayPlan | None]:
+    """Start agreeing on one decoder row bucket across EP participants.
+
+    The returned call waits for the DP all-reduce and gives the coordinated
+    plan, so the caller can enqueue other work while the replicas meet.
 
     ``num_tokens`` is the step's token bucket, which DP lockstep already makes
     equal on every rank. When it is at most ``local_bucket_max``, every rank
@@ -44,19 +48,45 @@ def coordinate_decoder_replay(
     on a rank whose plan kept 3 rows.
     """
     if 0 < num_tokens <= local_bucket_max:
-        return replace(plan, padded_num_tokens=num_tokens) if plan else None
+        local = replace(plan, padded_num_tokens=num_tokens) if plan else None
+        return lambda: local
     group = get_dp_group()
     if group.world_size == 1:
-        return plan
+        return lambda: plan
     count = torch.tensor(
         [num_tokens if plan is None else plan.padded_num_tokens],
         dtype=torch.int64,
         device="cpu",
     )
-    torch.distributed.all_reduce(
-        count, op=torch.distributed.ReduceOp.MAX, group=group.cpu_group
+    work = torch.distributed.all_reduce(
+        count, op=torch.distributed.ReduceOp.MAX, group=group.cpu_group, async_op=True
     )
-    return replace(plan, padded_num_tokens=int(count.item())) if plan else None
+
+    def finish() -> DecoderReplayPlan | None:
+        work.wait()
+        return replace(plan, padded_num_tokens=int(count.item())) if plan else None
+
+    return finish
+
+
+def coordinate_decoder_replay(
+    plan: DecoderReplayPlan | None, num_tokens: int, local_bucket_max: int = 0
+) -> DecoderReplayPlan | None:
+    """Make every EP participant enter the decoder with the same row bucket.
+
+    Blocking form of `start_decoder_replay_coordination`.
+    """
+    return start_decoder_replay_coordination(plan, num_tokens, local_bucket_max)()
+
+
+def decoder_buckets(num_tokens: int, compile_sizes) -> list[int]:
+    """The decoder row buckets a plan for a ``num_tokens`` step can pick.
+
+    Each stage dispatches by its own token bucket. Never introduce a second,
+    independent symbolic token dimension into vLLM's guard-free full graph.
+    """
+    sizes = {int(n) for n in compile_sizes if 0 < int(n) <= num_tokens}
+    return sorted({num_tokens, *sizes})
 
 
 def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
@@ -95,10 +125,11 @@ def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):
         replay_starts.append(replay_start)
         output_bounds.append(len(indices))
     kept = len(indices)
-    # Each stage dispatches by its own token bucket. Never introduce a second,
-    # independent symbolic token dimension into vLLM's guard-free full graph.
-    buckets = sorted({num_tokens, *(int(n) for n in compile_sizes if int(n) > 0)})
-    padded = next(n for n in buckets if n >= kept) if kept else 0
+    padded = (
+        next(n for n in decoder_buckets(num_tokens, compile_sizes) if n >= kept)
+        if kept
+        else 0
+    )
     return DecoderReplayPlan(
         tuple(indices), tuple(output_bounds), tuple(replay_starts), padded
     )

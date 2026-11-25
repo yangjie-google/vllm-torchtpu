@@ -38,15 +38,14 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     PACK4,
     QB4,
     ROWBLK,
+    align_up,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     _REF_BITCAST_JAX_VERSION,
     ACT_FNS,
     COLLECTIVE_ID,
-    COMBINE_CHUNK,
     COMBINE_GROUP,
-    COMBINE_LEAD,
-    COMBINE_PARITIES,
+    COMBINE_TOKENS,
     N_PREFETCH,
     N_PUSH_TABLES,
     N_SCALE_TABLES,
@@ -1871,133 +1870,271 @@ def build_push_moe_kernel(**kwargs):
     return fn
 
 
+# Tokens one fs-combine chunk reduces between two row waits; a multiple of
+# COMBINE_GROUP, since the chunk's output is relaid out a tile group at a time.
+FS_COMBINE_CHUNK = 32
+# Chunks of arrival rows staged at once (the ring), and how many chunks ahead
+# of the one being reduced their rows are started: 0 < lead < ring.
+FS_COMBINE_RING = 4
+FS_COMBINE_LEAD = 3
+# SMEM and HBM tables are tiled by this many entries; a staged table slice
+# starts and ends on a tile.
+_TABLE_TILE = 128
+
+
+def fs_combine_chunk(t_local, topk):
+    """Tokens per chunk of the fs combine at this shape, or 0 where it does
+    not apply: at least two blocks of FS_COMBINE_RING chunks, and two blocks'
+    table entries (topk a token) whole tiles, so that where a block's slice
+    sits in its staged window depends only on the block's parity."""
+    for ch in (FS_COMBINE_CHUNK, COMBINE_GROUP):
+        blk = FS_COMBINE_RING * ch
+        if (
+            not t_local % blk
+            and t_local >= 2 * blk
+            and not 2 * topk * blk % _TABLE_TILE
+        ):
+            return ch
+    return 0
+
+
+def fold_scaled_add(routed, addend, scale):
+    """addend + routed * scale in the routed output's dtype: the scale and the
+    shared-expert add as the MoE layer's caller applies them to its outputs
+    (two ops in that dtype, each result rounded)."""
+    return addend + routed * jnp.asarray(scale, routed.dtype)
+
+
 def _build_combine_fs_kernel(
-    *, t_local, topk, hidden, lane_blocks, wire_dtype, out_dtype
+    *, t_local, topk, hidden, lane_blocks, wire_dtype, out_dtype, out_scale=None
 ):
     """out[i] = sum_k scales[scl[i, k]] * w[i, k] * arrivals[pos[i, k]].
 
-    v2's combine kernel with the arrival-scale lookup folded in: `scl` (the
-    clamped mirror element), the router weight `w` and the flattened arrival
-    scale mirror ride scalar prefetch, so `arrival_scales[scl]` is read in
-    SMEM rather than by an XLA gather, which the SparseCore offloads and
-    serializes behind the other SparseCore work. Same f32 product, same order.
+    v2's combine with the arrival-scale lookup folded in: `scl` (the clamped
+    mirror element) indexes the flattened arrival scale mirror in SMEM rather
+    than through an XLA gather, which the SparseCore offloads and serializes
+    behind its other work. Same f32 coefficient, same order over k.
 
-    An arrival row is [lane blocks, 128] -- one register -- while the output
-    is [tokens, hidden], which is that layout transposed: a token's hidden
-    axis lies along sublanes in the row and along lanes in the output. The sum
-    therefore runs in the ROW's layout and only its bf16 result is relaid out,
-    so the sublane shuffle sees one bf16 token per group instead of topk
-    packed-f8 rows, and the live accumulator is one token wide.
+    The kernel is a pipeline of chunks of `ch` tokens: chunk c waits for its
+    topk * ch arrival rows (one DMA a row, started FS_COMBINE_LEAD chunks
+    earlier into ring slot c % FS_COMBINE_RING), starts chunk c + lead's rows,
+    sums its tokens and stores them. The time goes to the per-slot scalar
+    work (a row's DMA, its coefficient) beside the per-element vector work,
+    so both are kept to the minimum:
+
+    * Every SMEM read in the loop has a static address. The tables are read
+      a block of FS_COMBINE_RING chunks at a time, each block's slice staged
+      by DMA into one of two fixed SMEM buffers, and the loop body is
+      unrolled over the two; a dynamic index would cost an address add per
+      read. The pos slice is the one lead chunks ahead.
+    * The coefficient scales[scl] * w is formed on the vector unit from the
+      two splats: the same f32 product, one scalar op a slot fewer.
+    * A token is summed in the arrival row's layout ([lane blocks, 128], the
+      token's hidden axis along sublanes) and stored in f32; the output tile
+      group is read back with a sublane-strided load, one lane block of 16
+      tokens at a time, and rounded to bf16 there.
+
+    With `out_scale`, the call also takes the token mask and an addend of the
+    output's shape and returns what the layer's caller would make of them:
+    the combine, zero on masked rows, rounded, times out_scale, rounded, plus
+    the addend, rounded (see `fold_scaled_add`). The addend's rows are fetched
+    beside the chunk's arrival rows.
     """
-    tb = combine_step_tokens(t_local)
-    steps = t_local // tb
+    ch = fs_combine_chunk(t_local, topk)
+    assert ch, (t_local, topk)
+    ring, lead = FS_COMBINE_RING, FS_COMBINE_LEAD
     gt = COMBINE_GROUP
-    groups = tb // gt
     lanes = HIDDEN_LANE_BLOCK
+    blk = ring * ch
+    n_blocks = t_local // blk
+    n_tab = topk * blk
+    # A token's f32 sum, padded to whole registers in the accumulator.
+    acc_rows = align_up(lane_blocks, 8)
+    # Block b reads its own tokens' scl and w and starts the rows of the
+    # tokens lead chunks past its own, so its pos slice is `shift` entries
+    # later. Each slice is staged as the tile-aligned window around it; its
+    # offset in the window is static per buffer (fs_combine_chunk).
+    shift = topk * lead * ch
+    window = align_up(n_tab, _TABLE_TILE) + _TABLE_TILE
 
-    def kernel(
-        pos_sm,
-        scl_sm,
-        tw_sm,
-        scales_sm,
-        arr_hbm,
-        out_hbm,
-        rows_vm,
-        tile_vm,
-        out_vm,
-        row_sems,
-        out_sems,
-    ):
-        def start_row(base, parity, i, k):
-            # Alternate queues by slot: this kernel is one 4 KiB descriptor per
-            # arrival row and an in-order queue retires descriptors at a fixed
-            # rate, which for a row this small is slower than the row's own
-            # bytes. Both queues signal the one semaphore the step waits on,
-            # which counts bytes and not descriptors.
+    def at(buf, base):
+        """(window start, slice offset in it) of block b's slice that starts
+        `base` entries into the block, for b of parity buf."""
+        off = (buf * n_tab + base) % _TABLE_TILE
+        return buf * n_tab + base - off, off
+
+    # The loop covers pairs of blocks; the last two or three are unrolled
+    # after it, the last one starting no rows past the end.
+    tail = 2 + n_blocks % 2
+    # A window the loop stages (blocks up to the first unrolled one) is whole
+    # and must lie in the table; the unrolled blocks' windows stop at its end
+    # instead. The tables are padded only to whole tiles and as far as the
+    # loop's windows need.
+    first_tail = n_blocks - tail
+    table_len = max(
+        align_up(t_local * topk, _TABLE_TILE),
+        first_tail * n_tab + at(0, shift)[0] + window,
+    )
+    fold = out_scale is not None
+
+    def kernel(*refs):
+        if fold:
+            pos_sm, scales_sm, keep_sm, pos_hbm, scl_hbm, tw_hbm, arr_hbm, add_hbm = (
+                refs[:8]
+            )
+            refs = refs[8:]
+        else:
+            pos_sm, scales_sm, pos_hbm, scl_hbm, tw_hbm, arr_hbm = refs[:6]
+            refs = refs[6:]
+        out_hbm, pos_st, scl_st, tw_st, rows_vm, acc_vm, out_vm = refs[:7]
+        row_sems, out_sems, tab_sems, *add_scratch = refs[7:]
+
+        def add_copy(c, slot):
+            add_vm, add_sems = add_scratch
+            return pltpu.make_async_copy(
+                add_hbm.at[pl.ds(c * ch, ch)], add_vm.at[slot], add_sems.at[slot]
+            )
+
+        def stage_copies(b, buf):
+            # b - buf is even, so (b - buf) * n_tab is whole tiles.
+            pair = (b - buf) * n_tab
+            copies = []
+            for i, (src, st, base) in enumerate(
+                ((pos_hbm, pos_st, shift), (scl_hbm, scl_st, 0), (tw_hbm, tw_st, 0))
+            ):
+                start = pair + at(buf, base)[0]
+                if isinstance(b, int) and b > first_tail:
+                    size = min(window, table_len - start)
+                else:
+                    start, size = pl.multiple_of(start, _TABLE_TILE), window
+                copies.append(
+                    pltpu.make_async_copy(
+                        src.at[pl.ds(start, size)],
+                        st.at[pl.ds(buf * window, size)],
+                        tab_sems.at[i, buf],
+                    )
+                )
+            return copies
+
+        def start_row(p, slot, u, k):
+            # Alternate queues by slot: an in-order queue retires a small
+            # descriptor slower than its bytes. Both signal the slot's one
+            # semaphore, which counts bytes and not descriptors.
             pltpu.make_async_copy(
-                arr_hbm.at[pos_sm[(base + i) * topk + k]],
-                rows_vm.at[parity, k * tb + i],
-                row_sems.at[parity],
+                arr_hbm.at[p], rows_vm.at[slot, k * ch + u], row_sems.at[slot]
             ).start(priority=k % 2)
 
-        def reduce_token(base, parity, i):
-            """One token's weighted sum, in the arrival rows' own layout."""
-            acc = None
-            for k in range(topk):
-                idx = (base + i) * topk + k
-                c_val = scales_sm[scl_sm[idx]] * tw_sm[idx]
-                term = rows_vm[parity, k * tb + i].astype(jnp.float32) * c_val
-                acc = term if acc is None else acc + term
-            tile_vm[i] = cast(jax.Array, acc).astype(out_dtype)
+        def coef(buf, e):
+            e += buf * window + at(buf, 0)[1]
+            c = jnp.full((8, lanes), scales_sm[scl_st[e]], jnp.float32)
+            c = c * jnp.full((8, lanes), tw_st[e], jnp.float32)
+            return jnp.tile(c, (pl.cdiv(lane_blocks, 8), 1))[:lane_blocks]
 
-        def one_step(step, parity):
-            # The step's rows were started a step ago; the next step's are
-            # started beside this one's reduction, so their descriptor issue
-            # rides in slots the vector work leaves empty. The last step
-            # re-starts its own rows rather than branching -- the copy is never
-            # read and is drained below.
-            nxt = jnp.minimum(step + COMBINE_LEAD, steps - 1) * tb
-            base = step * tb
-            npar = (parity + COMBINE_LEAD) % COMBINE_PARITIES
+        def one_chunk(b, buf, r, last):
+            slot, nslot = r, (r + lead) % ring
+            pos_at = buf * window + at(buf, shift)[1]
             pltpu.make_async_copy(
-                rows_vm.at[parity], rows_vm.at[parity], row_sems.at[parity]
+                rows_vm.at[slot], rows_vm.at[slot], row_sems.at[slot]
             ).wait()
+            starts = not (last and r + lead >= ring)
+            if fold:
+                add_copy(0, slot).wait()
+                if starts:
+                    add_copy(b * ring + r + lead, nslot).start()
 
-            @pl.when(step >= COMBINE_PARITIES)
+            @pl.when(b > 0)
             def _():
                 pltpu.make_async_copy(
-                    out_vm.at[parity], out_vm.at[parity], out_sems.at[parity]
+                    out_vm.at[slot], out_vm.at[slot], out_sems.at[slot]
                 ).wait()
 
-            def one_chunk(chunk, carry):
-                for u in range(COMBINE_CHUNK):
-                    i = chunk * COMBINE_CHUNK + u
+            for u in range(ch):
+                e0 = (r * ch + u) * topk
+                if starts:
                     for k in range(topk):
-                        start_row(nxt, npar, i, k)
-                    reduce_token(base, parity, i)
-                return carry
-
-            lax.fori_loop(0, tb // COMBINE_CHUNK, one_chunk, jnp.int32(0))
-            for g in range(groups):
-                out_vm[parity, pl.ds(g * gt, gt)] = tile_vm[pl.ds(g * gt, gt)].reshape(
-                    gt, hidden
-                )
+                        start_row(pos_st[pos_at + e0 + k], nslot, u, k)
+                acc = None
+                for k in range(topk):
+                    term = rows_vm[slot, k * ch + u].astype(jnp.float32) * coef(
+                        buf, e0 + k
+                    )
+                    acc = term if acc is None else acc + term
+                if fold:
+                    keep = keep_sm[b * blk + r * ch + u] != 0
+                    acc = jnp.where(keep, acc, jnp.zeros_like(acc))
+                g, gu = divmod(u, gt)
+                acc_vm[g, pl.ds(gu * acc_rows, lane_blocks)] = acc
+            for g in range(ch // gt):
+                for lb in range(lane_blocks):
+                    tile = (slot, pl.ds(g * gt, gt), pl.ds(lb * lanes, lanes))
+                    v = acc_vm[g, pl.ds(lb, gt, stride=acc_rows)].astype(out_dtype)
+                    if fold:
+                        v = fold_scaled_add(v, add_scratch[0][tile], out_scale)
+                    out_vm[tile] = v
             pltpu.make_async_copy(
-                out_vm.at[parity], out_hbm.at[pl.ds(step * tb, tb)], out_sems.at[parity]
+                out_vm.at[slot],
+                out_hbm.at[pl.ds(b * blk + r * ch, ch)],
+                out_sems.at[slot],
             ).start()
 
-        def step_pair(pair, carry):
-            for parity in range(COMBINE_PARITIES):
-                one_step(pair * COMBINE_PARITIES + parity, parity)
+        def one_block(b, buf, last=False):
+            for cp in stage_copies(b, buf):
+                cp.wait()
+            if not last:
+                for cp in stage_copies(b + 1, 1 - buf):
+                    cp.start()
+            for r in range(ring):
+                one_chunk(b, buf, r, last)
+
+        def block_pair(j, carry):
+            for buf in range(2):
+                one_block(2 * j + buf, buf)
             return carry
 
-        for p in range(COMBINE_LEAD):
-            for i in range(tb):
+        for cp in stage_copies(0, 0):
+            cp.start()
+        for c in range(lead):
+            for u in range(ch):
                 for k in range(topk):
-                    start_row(p * tb, p, i, k)
-        lax.fori_loop(0, steps // COMBINE_PARITIES, step_pair, jnp.int32(0))
-        # The last COMBINE_LEAD steps re-start the final step's rows into the
-        # buffers the loop no longer reads; drain them, and the stores.
-        for p in range(COMBINE_LEAD):
-            pltpu.make_async_copy(rows_vm.at[p], rows_vm.at[p], row_sems.at[p]).wait()
-        for p in range(COMBINE_PARITIES):
-            pltpu.make_async_copy(out_vm.at[p], out_vm.at[p], out_sems.at[p]).wait()
+                    start_row(pos_sm[(c * ch + u) * topk + k], c, u, k)
+            if fold:
+                add_copy(c, c).start()
+        lax.fori_loop(0, (n_blocks - tail) // 2, block_pair, jnp.int32(0))
+        for i in range(tail):
+            one_block(
+                n_blocks - tail + i,
+                i % 2,
+                last=i == tail - 1,
+            )
+        for s in range(ring):
+            pltpu.make_async_copy(out_vm.at[s], out_vm.at[s], out_sems.at[s]).wait()
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+    add_scratch = (
+        (
+            pltpu.VMEM((ring, ch, hidden), out_dtype),
+            pltpu.SemaphoreType.DMA((ring,)),
+        )
+        if fold
+        else ()
+    )
     call = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=4,
-            in_specs=[hbm],
+            num_scalar_prefetch=2 + fold,
+            in_specs=[hbm] * (4 + fold),
             out_specs=hbm,
             scratch_shapes=(
-                pltpu.VMEM(
-                    (COMBINE_PARITIES, topk * tb, lane_blocks, lanes), wire_dtype
-                ),
-                pltpu.VMEM((tb, lane_blocks, lanes), out_dtype),
-                pltpu.VMEM((COMBINE_PARITIES, tb, hidden), out_dtype),
-                pltpu.SemaphoreType.DMA((COMBINE_PARITIES,)),
-                pltpu.SemaphoreType.DMA((COMBINE_PARITIES,)),
+                pltpu.SMEM((2 * window,), jnp.int32),
+                pltpu.SMEM((2 * window,), jnp.int32),
+                pltpu.SMEM((2 * window,), jnp.float32),
+                pltpu.VMEM((ring, topk * ch, lane_blocks, lanes), wire_dtype),
+                pltpu.VMEM((ch // gt, gt * acc_rows, lanes), jnp.float32),
+                pltpu.VMEM((ring, ch, hidden), out_dtype),
+                pltpu.SemaphoreType.DMA((ring,)),
+                pltpu.SemaphoreType.DMA((ring,)),
+                pltpu.SemaphoreType.DMA((3, 2)),
+                *add_scratch,
             ),
             grid=(),
         ),
@@ -2005,18 +2142,31 @@ def _build_combine_fs_kernel(
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=host.vmem_limit(), disable_bounds_checks=True
         ),
-        name=f"moe_v2_combine_t{t_local}_k{topk}_b{tb}_p{COMBINE_PARITIES}_fs",
+        name=f"moe_v2_combine_t{t_local}_k{topk}_c{ch}_r{ring}_l{lead}_fs"
+        + ("_add" if fold else ""),
     )
 
-    def fn(arrivals, arrival_scales, scl, topk_weights, pos):
-        # Every table flattens TOKEN-major, like v2's combine.
-        return call(
-            pos.astype(jnp.int32).reshape(-1),
-            scl.astype(jnp.int32).reshape(-1),
-            topk_weights.astype(jnp.float32).reshape(-1),
-            arrival_scales.astype(jnp.float32).reshape(-1),
+    def fn(arrivals, arrival_scales, scl, topk_weights, pos, keep=None, addend=None):
+        # Every table flattens TOKEN-major, like v2's combine, padded to
+        # table_len. pos rides scalar prefetch for the first lead chunks'
+        # rows and HBM for the rest.
+        def flat(table, dtype):
+            table = table.astype(dtype).reshape(-1)
+            if table.size == table_len:  # no zero-width pad op in the program
+                return table
+            return jnp.pad(table, (0, table_len - table.size))
+
+        pos = flat(pos, jnp.int32)
+        scales = arrival_scales.astype(jnp.float32).reshape(-1)
+        tables = (
+            pos,
+            flat(scl, jnp.int32),
+            flat(topk_weights, jnp.float32),
             arrivals,
         )
+        if not fold:
+            return call(pos, scales, *tables)
+        return call(pos, scales, keep.astype(jnp.int32).reshape(-1), *tables, addend)
 
     return fn
 
@@ -2034,5 +2184,152 @@ def build_combine_fs_kernel(**kwargs):
             fn = _COMBINE_CACHE.get(key)
             if fn is None:
                 fn = _build_combine_fs_kernel(**kwargs)
+                _COMBINE_CACHE[key] = fn
+    return fn
+
+
+def decode_combine_applies(t_local):
+    """Whether the one-pass decode combine serves this step's shape: below the
+    pipelined combine's floor, whole bf16 output tiles, and at most
+    COMBINE_TOKENS tokens -- what one step of the pipelined combine stages and
+    waits for at once (at the drafter's 240 rows x 3 the single wait on every
+    row never returned)."""
+    return (
+        not combine_step_tokens(t_local)
+        and t_local % COMBINE_GROUP == 0
+        and t_local <= COMBINE_TOKENS
+    )
+
+
+def _build_combine_decode_kernel(
+    *, t_local, topk, mirror_lanes, lane_blocks, wire_dtype, out_dtype
+):
+    """out[i] = sum_k scales[scl[i, k]] * w[i, k] * arrivals[pos[i, k]], for a
+    decode step's few tokens.
+
+    The fs combine's arithmetic (same f32 coefficient, same order over k)
+    without its step pipeline: every arrival row and the mirror sublane
+    holding its scale are fetched up front, then one pass sums them. XLA's
+    epilogue at these sizes gathers the rows on the TensorCore one at a time
+    and reads the whole scale mirror to look up t_local * topk values.
+
+    `sub`/`lane` split the clamped mirror position; the sublane's 128 scales
+    land in SMEM and the lane is read there.
+    """
+    n = t_local * topk
+    gt = COMBINE_GROUP
+    hidden = lane_blocks * HIDDEN_LANE_BLOCK
+
+    def kernel(
+        pos_sm,
+        sub_sm,
+        lane_sm,
+        tw_sm,
+        scales_hbm,
+        arr_hbm,
+        out_ref,
+        rows_vm,
+        scl_sm,
+        tile_vm,
+        sems,
+    ):
+        def start(i, carry):
+            for k in range(topk):
+                j = i * topk + k
+                # Alternate queues by slot, as the pipelined combine does.
+                pltpu.make_async_copy(
+                    arr_hbm.at[pos_sm[j]], rows_vm.at[k * t_local + i], sems.at[0]
+                ).start(priority=k % 2)
+                pltpu.make_async_copy(
+                    scales_hbm.at[pl.ds(sub_sm[j], 1)],
+                    scl_sm.at[pl.ds(j, 1)],
+                    sems.at[1],
+                ).start()
+            return carry
+
+        lax.fori_loop(0, t_local, start, jnp.int32(0))
+        # DMA semaphores count bytes: one wait the size of each buffer.
+        pltpu.make_async_copy(scl_sm, scl_sm, sems.at[1]).wait()
+        pltpu.make_async_copy(rows_vm, rows_vm, sems.at[0]).wait()
+
+        def reduce_token(i, carry):
+            acc = None
+            for k in range(topk):
+                j = i * topk + k
+                c_val = scl_sm[j, lane_sm[j]] * tw_sm[j]
+                term = rows_vm[k * t_local + i].astype(jnp.float32) * c_val
+                acc = term if acc is None else acc + term
+            tile_vm[i] = cast(jax.Array, acc).astype(out_dtype)
+            return carry
+
+        lax.fori_loop(0, t_local, reduce_token, jnp.int32(0))
+        for g in range(t_local // gt):
+            out_ref[pl.ds(g * gt, gt)] = tile_vm[pl.ds(g * gt, gt)].reshape(gt, hidden)
+
+    rows_bytes = n * lane_blocks * HIDDEN_LANE_BLOCK * jnp.dtype(wire_dtype).itemsize
+    tile_bytes = t_local * hidden * jnp.dtype(out_dtype).itemsize
+    call = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=4,
+            in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)] * 2,
+            out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
+            scratch_shapes=(
+                pltpu.VMEM((n, lane_blocks, HIDDEN_LANE_BLOCK), wire_dtype),
+                pltpu.SMEM((n, mirror_lanes), jnp.float32),
+                pltpu.VMEM((t_local, lane_blocks, HIDDEN_LANE_BLOCK), out_dtype),
+                pltpu.SemaphoreType.DMA((2,)),
+            ),
+            grid=(),
+        ),
+        out_shape=jax.ShapeDtypeStruct((t_local, hidden), out_dtype),
+        # Only what the call holds (plus slack for Mosaic's own scratch), so
+        # XLA can keep the layer's neighbouring values in VMEM around it.
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=rows_bytes + 2 * tile_bytes + (2 << 20),
+            disable_bounds_checks=True,
+        ),
+        name=f"moe_combine_decode_t{t_local}_k{topk}",
+    )
+
+    # One jit around the call: the HBM pins below are only for the pallas_call
+    # to read, and an eager shard_map would hand them to other primitives.
+    @jax.jit
+    def pinned_call(pos, sub, lane, tw, arrival_scales, arrivals):
+        # Left in HBM: only t_local * topk rows and sublanes are read, and
+        # otherwise XLA stages both whole buffers into VMEM ahead of the call.
+        return call(
+            pos,
+            sub,
+            lane,
+            tw,
+            pltpu.with_memory_space_constraint(arrival_scales, pltpu.HBM),
+            pltpu.with_memory_space_constraint(arrivals, pltpu.HBM),
+        )
+
+    def fn(arrivals, arrival_scales, scl, topk_weights, pos):
+        # Token-major tables, like the fs combine.
+        scl = scl.astype(jnp.int32).reshape(-1)
+        return pinned_call(
+            pos.astype(jnp.int32).reshape(-1),
+            scl // mirror_lanes,
+            scl % mirror_lanes,
+            topk_weights.astype(jnp.float32).reshape(-1),
+            arrival_scales.astype(jnp.float32),
+            arrivals,
+        )
+
+    return fn
+
+
+def build_combine_decode_kernel(**kwargs):
+    """Memoizing front door for _build_combine_decode_kernel."""
+    key = ("decode",) + tuple(sorted((k, str(v)) for k, v in kwargs.items()))
+    fn = _COMBINE_CACHE.get(key)
+    if fn is None:
+        with _COMBINE_CACHE_LOCK:
+            fn = _COMBINE_CACHE.get(key)
+            if fn is None:
+                fn = _build_combine_decode_kernel(**kwargs)
                 _COMBINE_CACHE[key] = fn
     return fn

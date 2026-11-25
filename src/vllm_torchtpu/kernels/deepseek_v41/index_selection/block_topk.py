@@ -51,30 +51,49 @@ def _vmem_words(rows, width, block_width, k, blocks, block_size, buffers, reside
     rows_words = (
         buffers * width if resident else 2 * _chunk(width) + blocks * block_size
     )
+    keys = blocks * block_size + plsc.get_sparse_core_info().num_lanes
     return (
         rows_words
-        + buffers * block_width
+        # Block maxima, later the kept keys' bits.
+        + max(buffers * block_width, keys)
         + RADIX_BUCKETS
         + blocks
-        + blocks * block_size
+        # Kept key IDs, and published IDs (at most as many).
+        + 2 * keys
         + k
         + _length_words(rows)
     )
 
 
-def _plan(rows, width, block_width, k, blocks, block_size):
+def _plan(rows, width, block_width, k, blocks, block_size, allow_resident=True):
     """(resident, buffers): resident rows when they fit, double-buffered if room."""
     capacity = plsc.get_sparse_core_info().vmem_capacity_bytes
     sizes = (rows, width, block_width, k, blocks, block_size)
-    for resident in (True, False):
+    for resident in (True, False) if allow_resident else (False,):
         for buffers in (2, 1):
             if 4 * _vmem_words(*sizes, buffers, resident) <= capacity:
                 return resident, buffers
     return None
 
 
-def is_supported(rows: int, width: int, k: int, block_size: int) -> bool:
-    """Lane-aligned shapes whose block maxima fit SparseCore VMEM."""
+def _maxima_chunk(block_width: int) -> int:
+    """Block maxima per read of given maxima."""
+    return math.gcd(block_width, 8192)
+
+
+def is_supported(
+    rows: int,
+    width: int,
+    k: int,
+    block_size: int,
+    given_maxima: bool = False,
+    maxima_block: int | None = None,
+) -> bool:
+    """Lane-aligned shapes whose block maxima fit SparseCore VMEM.
+
+    `given_maxima`: the caller supplies the maxima, which streams the rows;
+    `maxima_block` keys each (default `block_size`), folded into blocks.
+    """
     if jax.default_backend() != "tpu":
         return False
     info = pltpu.get_tpu_info()
@@ -86,8 +105,16 @@ def is_supported(rows: int, width: int, k: int, block_size: int) -> bool:
         return False
     blocks = default_blocks(k, sc.num_lanes)
     block_width = pl.cdiv(pl.cdiv(width, block_size), alignment) * alignment
-    plan = _plan(rows, width, block_width, k, blocks, block_size)
-    streamable = _chunk(width) % (sc.num_lanes * block_size) == 0
+    plan = _plan(rows, width, block_width, k, blocks, block_size, not given_maxima)
+    # Streamed rows fetch whole vectors of blocks in tile-aligned spans.
+    span = sc.num_lanes * block_size
+    streamable = _chunk(width) % span == 0 and span % alignment == 0
+    if given_maxima and maxima_block:
+        fold = block_size // maxima_block
+        # Folded maxima are staged in the two score chunks streamed rows keep.
+        staged = fold * _maxima_chunk(block_width)
+        if block_size % maxima_block or fold & (fold - 1) or staged > 2 * _chunk(width):
+            return False
     return blocks * block_size < width and plan is not None and (plan[0] or streamable)
 
 
@@ -99,18 +126,30 @@ def block_topk(
     k: int,
     block_size: int,
     publish: int = 0,
+    maxima: jax.Array | None = None,
+    maxima_block: int | None = None,
     scheduling_group_id: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Return ascending top-k key IDs per row, padded with -1.
 
     Args:
-        scores: FP32 [rows, width]; keys at or past a row's length are -inf.
+        scores: FP32 [rows, width]; keys from a row's length to the end of its
+            last block are -inf. Later keys are never read unmasked.
         lengths: Int32 [rows] visible keys, clipped to [0, width].
         k: Selected keys per row. Negative infinity is never selected.
         block_size: Keys per block maximum.
         publish: Also return the IDs of the `publish` highest block maxima,
             the newest visible block forced first; ascending, -1 padded, and
             ties keep the lowest IDs.
+        maxima: Optional FP32 [rows, cdiv(width, maxima_block) or more] maxima
+            of each row's `maxima_block`-key blocks, as `scores` holds them
+            (so -inf from a row's length to the end of its last `block_size`
+            block); later blocks are never read. Given, the kernel
+            reads them instead of reducing the scores, and fetches only the
+            chosen blocks' keys.
+        maxima_block: Keys per given maximum, a power-of-two divisor of
+            `block_size` (default `block_size`); finer maxima are folded as
+            they are read, for blocks whose maxima would not fit VMEM.
         scheduling_group_id: Optional XLA scheduling-group ID.
     """
     rows, width = scores.shape
@@ -119,22 +158,51 @@ def block_topk(
     if (
         scores.dtype != jnp.float32
         or lengths.shape != (rows,)
-        or not is_supported(rows, width, k, block_size)
+        or not is_supported(
+            rows, width, k, block_size, maxima is not None, maxima_block
+        )
         or publish % lanes
     ):
         raise ValueError("Unsupported block top-k shapes or dtypes")
     blocks = default_blocks(k, lanes, forced=bool(publish))
     candidates = blocks * block_size
     block_width = pl.cdiv(pl.cdiv(width, block_size), alignment) * alignment
+    given = maxima is not None
+    maxima_block = maxima_block or block_size
+    fold = block_size // maxima_block
+    if given and (
+        maxima.dtype != jnp.float32
+        or maxima.shape[0] != rows
+        or maxima.shape[1] < pl.cdiv(width, maxima_block)
+        or block_size % maxima_block
+        or fold & (fold - 1)
+    ):
+        raise ValueError(
+            "Block maxima must be FP32 [rows, cdiv(width, maxima_block)] or wider, "
+            "with maxima_block a power-of-two divisor of block_size"
+        )
     lengths = jnp.clip(lengths.astype(jnp.int32), 0, width)
     # 1-D: a [rows, lanes] buffer pads each row to 128 lanes in VMEM.
     token_lengths = jnp.pad(lengths, (0, _length_words(rows) - rows))
-    plan = _plan(rows, width, block_width, k, blocks, block_size)
+    plan = _plan(
+        rows, width, block_width, k, blocks, block_size, allow_resident=not given
+    )
     assert plan is not None
     resident, buffers = plan
     chunk = _chunk(width)
+    # Folded given maxima are staged in the score buffer, which streamed rows
+    # size for two chunks.
+    maxima_chunk = _maxima_chunk(block_width)
+    staged = fold * maxima_chunk if fold > 1 else lanes
+    inputs = (scores, token_lengths)
+    if given:
+        columns = min(maxima.shape[1], fold * block_width)
+        maxima = jnp.pad(
+            maxima[:, :columns], ((0, 0), (0, fold * block_width - columns))
+        )
+        inputs += (maxima,)
     # Streamed rows read scores in two alternating chunks.
-    score_words = buffers * width if resident else 2 * chunk
+    score_words = buffers * width if resident else staged if given else 2 * chunk
     mesh = plsc.VectorSubcoreMesh(
         core_axis_name="core",
         subcore_axis_name="subcore",
@@ -149,12 +217,13 @@ def block_topk(
         mesh=mesh,
         scratch_types=dict(
             score_buffers=pltpu.VMEM((score_words,), jnp.float32),
-            maxima=pltpu.VMEM((block_width,), jnp.float32),
+            # Block maxima, then the kept keys' bits.
+            maxima=pltpu.VMEM((max(block_width, candidates + lanes),), jnp.float32),
             histogram=pltpu.VMEM((RADIX_BUCKETS,), jnp.int32),
-            block_ids=pltpu.VMEM((blocks,), jnp.int32),
-            # Ordered key bits; first holds the published block IDs.
-            keys=pltpu.VMEM((max(candidates, publish),), jnp.int32),
-            output=pltpu.VMEM((k,), jnp.int32),
+            # The chosen block IDs, then the selected key IDs.
+            selected=pltpu.VMEM((blocks + k,), jnp.int32),
+            published=pltpu.VMEM((max(publish, lanes),), jnp.int32),
+            key_ids=pltpu.VMEM((candidates + lanes,), jnp.int32),
             limits=pltpu.VMEM((_length_words(rows),), jnp.int32),
             # Streamed rows: the chosen blocks' keys, fetched from HBM.
             fetched=pltpu.VMEM((lanes if resident else candidates,), jnp.float32),
@@ -170,14 +239,13 @@ def block_topk(
     def kernel(
         score_ref,
         length_ref,
-        out_ref,
-        *publish_refs,
+        *refs,
         score_buffers,
         maxima,
         histogram,
-        block_ids,
-        keys,
-        output,
+        selected,
+        published,
+        key_ids,
         limits,
         fetched,
         score_sems,
@@ -186,7 +254,12 @@ def block_topk(
         publish_sem,
         fetch_sem,
     ):
+        maxima_ref, (out_ref, *publish_refs) = (
+            (refs[0], refs[1:]) if given else (None, refs)
+        )
         radix = Radix(histogram, lanes)
+        block_ids = selected.at[pl.ds(0, blocks)]
+        output = selected.at[pl.ds(blocks, k)]
         strided = [radix.lane_ids * block_size + j for j in range(block_size)]
         first = jax.lax.axis_index("core") * mesh.num_subcores
         first += jax.lax.axis_index("subcore")
@@ -239,24 +312,87 @@ def block_topk(
                     start = c * (chunk // block_size) + i * lanes
                     maxima[pl.ds(start, lanes)] = block_max(window)
 
-        def fetch_blocks(row_id, count):
-            """DMA the keys of the first `count` chosen blocks into `fetched`."""
+        folded = [radix.lane_ids * fold + j for j in range(fold)]
 
-            def copy(b, owner):
+        # Given maxima are read in half chunks, two in flight, each prepared as
+        # it lands; folded ones are staged in the halves of the score buffer.
+        stage = maxima_chunk // 2
+
+        def read_maxima(row_id, live_blocks, block_chunks, prepare):
+            """Read and prepare the given maxima of the visible blocks."""
+            reads = pl.cdiv(live_blocks, stage)
+
+            def copy(c):
+                slot = c % 2
+                if fold == 1:
+                    window = pl.ds(c * stage, stage)
+                    return pltpu.make_async_copy(
+                        maxima_ref.at[row_id, window],
+                        maxima.at[window],
+                        score_sems.at[slot],
+                    )
                 return pltpu.make_async_copy(
-                    score_ref.at[row_id, pl.ds(owner * block_size, block_size)],
-                    fetched.at[pl.ds(b * block_size, block_size)],
-                    fetch_sem,
+                    maxima_ref.at[row_id, pl.ds(c * fold * stage, fold * stage)],
+                    score_buffers.at[pl.ds(slot * fold * stage, fold * stage)],
+                    score_sems.at[slot],
                 )
 
-            @pl.loop(0, count)
-            def start(b):
-                owner = plsc.load_gather(block_ids, [jnp.full(lanes, b, jnp.int32)])
-                copy(b, owner[0]).start()
+            pl.when(reads > 0)(lambda: copy(0).start())
+            pl.when(reads > 1)(lambda: copy(1).start())
 
-            @pl.loop(0, count)
-            def land(b):
-                copy(0, 0).wait()
+            @pl.loop(0, reads)
+            def land(c):
+                copy(c).wait()
+                if fold > 1:
+                    staging = (c % 2) * fold * stage
+
+                    @plsc.parallel_loop(0, stage // lanes, unroll=8)
+                    def reduce(i):
+                        # Lane j folds the `fold` maxima of its block; strided
+                        # slices are refused, so gather at constant offsets.
+                        window = score_buffers.at[
+                            pl.ds(staging + i * lanes * fold, lanes * fold)
+                        ]
+                        values = plsc.load_gather(window, [folded[0]])
+                        for offset in folded[1:]:
+                            values = jnp.maximum(
+                                values, plsc.load_gather(window, [offset])
+                            )
+                        maxima[pl.ds(c * stage + i * lanes, lanes)] = values
+
+                pl.when(c + 2 < reads)(lambda: copy(c + 2).start())
+                vectors = stage // lanes
+                prepare(c * vectors, jnp.minimum((c + 1) * vectors, block_chunks))
+
+        def fetch_blocks(row_id, count):
+            """DMA the keys of the first `count` chosen blocks into `fetched`.
+
+            Whole vectors of block IDs are read, so lane extraction stays off
+            each copy; blocks past `count` (-1) fetch block 0 unread.
+            """
+            vectors = pl.cdiv(count, lanes)
+
+            @pl.loop(0, vectors)
+            def start(v):
+                ids = block_ids[pl.ds(v * lanes, lanes)]
+                columns = jnp.maximum(ids, 0) * block_size
+                for j in range(lanes):
+                    column = pl.multiple_of(columns[j], block_size)
+                    pltpu.make_async_copy(
+                        score_ref.at[row_id, pl.ds(column, block_size)],
+                        fetched.at[pl.ds((v * lanes + j) * block_size, block_size)],
+                        fetch_sem,
+                    ).start()
+
+            # One wait for every copy: a descriptor of their total size, of the
+            # same HBM-to-VMEM kind so the semaphore counts the same units.
+            words = pl.ds(0, pl.multiple_of(vectors * span, span))
+
+            @pl.when(vectors > 0)
+            def _():
+                pltpu.make_async_copy(
+                    score_ref.at[row_id, words], fetched.at[words], fetch_sem
+                ).wait()
 
         length_copy = pltpu.async_copy(length_ref, limits, length_sem)
         pl.when(first < rows)(lambda: start_row(first, 0))
@@ -277,8 +413,6 @@ def block_topk(
             live_blocks = pl.cdiv(tokens, block_size)
             block_chunks = pl.cdiv(live_blocks, lanes)
             base = slot * width
-            if not resident:
-                stream_maxima(row_id, tokens)
             radix.clear()
 
             def block_values(i):
@@ -287,23 +421,31 @@ def block_topk(
                 # Blocks past the length read in-row keys; the caller masks them.
                 return block_max(score_buffers.at[pl.ds(base + i * span, span)])
 
-            @plsc.parallel_loop(0, block_chunks, unroll=8)
-            def prepare_blocks(i):
-                positions = radix.positions(i)
-                values = block_values(i)
-                if publish:
-                    # Publication rule: the newest visible block always wins.
-                    values = jnp.where(positions == live_blocks - 1, jnp.inf, values)
-                live = positions < live_blocks
-                bits = _ordered_bits(jnp.where(live, values, -jnp.inf))
-                maxima[pl.ds(i * lanes, lanes)] = bits.view(jnp.float32)
-                radix.add(bits)
+            def prepare(start, stop):
+                @plsc.parallel_loop(start, stop, unroll=8)
+                def prepare_blocks(i):
+                    positions = radix.positions(i)
+                    values = block_values(i)
+                    if publish:
+                        # Publication rule: the newest visible block always wins.
+                        values = jnp.where(
+                            positions == live_blocks - 1, jnp.inf, values
+                        )
+                    live = positions < live_blocks
+                    bits = _ordered_bits(jnp.where(live, values, -jnp.inf))
+                    maxima[pl.ds(i * lanes, lanes)] = bits.view(jnp.float32)
+                    radix.add(bits)
+
+            if given:
+                read_maxima(row_id, live_blocks, block_chunks, prepare)
+            else:
+                if not resident:
+                    stream_maxima(row_id, tokens)
+                prepare(0, block_chunks)
 
             publish_copy = None
             if publish:
                 (publish_ref,) = publish_refs
-                # Staged in `keys`, which stage 2 overwrites after the copy.
-                published = keys.at[pl.ds(0, publish)]
                 top = radix.threshold(maxima, block_chunks, publish)
                 radix.emit(maxima, block_chunks, publish, top, published)
                 publish_copy = pltpu.async_copy(
@@ -316,45 +458,71 @@ def block_topk(
                 def refill(i):
                     radix.add(maxima[pl.ds(i * lanes, lanes)].view(jnp.uint32))
 
-            chosen = radix.threshold(maxima, block_chunks, blocks)
-            radix.emit(maxima, block_chunks, blocks, chosen, block_ids)
+            # Stage 1 selects blocks, stage 2 their keys, through one copy of
+            # the selection: the SparseCore loads the program on every call.
+            def select(stage, chunks):
+                keys = stage == 1
+                quota = jnp.where(keys, k, blocks)
+                selection = radix.threshold(maxima, chunks, quota)
 
-            # Stage 2: the chosen blocks' keys, from the resident row or HBM.
-            def owners(i):
-                candidate = radix.positions(i)
-                owner = plsc.load_gather(block_ids, [candidate // block_size])
-                return owner, owner * block_size + candidate % block_size
+                @pl.when(keys & (row_id > first))
+                def wait_previous_output():
+                    pltpu.make_async_copy(
+                        output, out_ref.at[row_id - stride], output_sem
+                    ).wait()
 
+                def ids(i):
+                    kept = key_ids[pl.ds(jnp.where(keys, i * lanes, 0), lanes)]
+                    return jnp.where(keys, kept, radix.positions(i))
+
+                offset = jnp.where(keys, blocks, 0)
+                radix.emit(maxima, chunks, quota, selection, selected, ids, offset)
+
+                # After stage 1: the chosen blocks' keys, from the resident row
+                # or HBM, replace the block maxima.
+                total, _, gate, _, _ = selection
+                chosen_blocks = jnp.where(keys, 0, jnp.minimum(total, blocks))
+                key_chunks = pl.cdiv(chosen_blocks * block_size, lanes)
+                if not resident:
+                    fetch_blocks(row_id, chosen_blocks)
+                radix.clear()
+
+                # Each chosen block holds a key at or above the blocks' gate, so
+                # the k-th largest key does too: keep only such keys, in order.
+                @plsc.parallel_loop(
+                    0, key_chunks, carry=jnp.zeros(lanes, jnp.int32), unroll=4
+                )
+                def gather_keys(i, kept):
+                    candidate = radix.positions(i)
+                    owner = plsc.load_gather(block_ids, [candidate // block_size])
+                    owned = owner * block_size + candidate % block_size
+                    valid = (owner >= 0) & (owned < tokens)
+                    if resident:
+                        index = base + jnp.where(valid, owned, 0)
+                        values = plsc.load_gather(score_buffers, [index])
+                    else:
+                        values = fetched[pl.ds(i * lanes, lanes)]
+                    bits = _ordered_bits(jnp.where(valid, values, -jnp.inf))
+                    above = bits >= gate
+                    slots = kept + plsc.cumsum(above.astype(jnp.int32)) - 1
+                    plsc.store_scatter(
+                        maxima, [slots], bits.view(jnp.float32), mask=above
+                    )
+                    plsc.store_scatter(key_ids, [slots], owned, mask=above)
+                    radix.add(jnp.where(above, bits, jnp.uint32(0)))
+                    return kept + plsc.all_reduce_population_count(above)
+
+                # Zero bits pad the last vector below every selected key.
+                plsc.store_scatter(
+                    maxima,
+                    [gather_keys + radix.lane_ids],
+                    jnp.zeros(lanes, jnp.float32),
+                )
+                return jnp.where(keys, chunks, pl.cdiv(gather_keys[0], lanes))
+
+            jax.lax.fori_loop(0, 2, select, block_chunks)
             if publish_copy is not None:
                 publish_copy.wait()
-            chosen_blocks = jnp.minimum(chosen[0], blocks)
-            key_chunks = pl.cdiv(chosen_blocks * block_size, lanes)
-            if not resident:
-                fetch_blocks(row_id, chosen_blocks)
-            radix.clear()
-
-            @plsc.parallel_loop(0, key_chunks, unroll=4)
-            def gather_keys(i):
-                owner, ids = owners(i)
-                valid = (owner >= 0) & (ids < tokens)
-                if resident:
-                    index = base + jnp.where(valid, ids, 0)
-                    values = plsc.load_gather(score_buffers, [index])
-                else:
-                    values = fetched[pl.ds(i * lanes, lanes)]
-                bits = _ordered_bits(jnp.where(valid, values, -jnp.inf))
-                keys[pl.ds(i * lanes, lanes)] = bits.view(jnp.int32)
-                radix.add(bits)
-
-            selection = radix.threshold(keys, key_chunks, k)
-
-            @pl.when(row_id > first)
-            def wait_previous_output():
-                pltpu.make_async_copy(
-                    output, out_ref.at[row_id - stride], output_sem
-                ).wait()
-
-            radix.emit(keys, key_chunks, k, selection, output, lambda i: owners(i)[1])
             pltpu.async_copy(output, out_ref.at[row_id], output_sem)
             if buffers == 1:
                 pl.when(row_id + stride < rows)(lambda: start_row(row_id + stride, 0))
@@ -364,7 +532,7 @@ def block_topk(
             last_row = first + ((rows - 1 - first) // stride) * stride
             pltpu.make_async_copy(output, out_ref.at[last_row], output_sem).wait()
 
-    result = kernel(scores, token_lengths)
+    result = kernel(*inputs)
     if scheduling_group_id is not None:
         result = jax.tree.map(
             lambda x: xla_metadata.set_xla_metadata(

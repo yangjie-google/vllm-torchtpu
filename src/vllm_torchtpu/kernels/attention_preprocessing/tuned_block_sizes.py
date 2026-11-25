@@ -21,6 +21,12 @@ class QBRopeConfig:
     vmem_limit_bytes: int = 60 * 1024 * 1024
 
 
+# Head pairs (1024 FP8 columns each) of a decode Q-B call read from an
+# XLA-staged VMEM copy instead of streamed: XLA issues that copy only a few
+# microseconds before the call, so it holds what one DMA moves in that time.
+QB_RESIDENT_HEAD_PAIRS = 4
+
+
 @dataclasses.dataclass(frozen=True)
 class QARopeConfig:
     """Block sizes of ``qa_rope.fused_qa_kv_norm_rope``.
@@ -48,6 +54,12 @@ QA_ROPE_TUNING = {
     (7, 288, 5120, 512): QARopeConfig(token_block=288),
     (7, 240, 5120, 1792): QARopeConfig(token_block=240, weight_chunk=1792),
 }
+
+
+# Largest padded token count whose single-tile Q-A/KV call reads its weight as
+# an XLA-staged VMEM input (checked at 16-64 rows, the decode and DSpark draft
+# buckets); larger tiles keep streaming the weight themselves.
+RESIDENT_WEIGHT_MAX_TOKENS = 64
 
 
 @dataclasses.dataclass(frozen=True)

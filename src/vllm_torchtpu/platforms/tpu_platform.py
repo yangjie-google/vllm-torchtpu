@@ -4,6 +4,7 @@
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
+import functools
 import os
 import time
 from typing import TYPE_CHECKING, Any, Protocol, Union, cast
@@ -363,6 +364,18 @@ def _register_tpu_kv_connectors() -> None:
         KVConnectorFactory.register_connector(name, module_path, name)
 
 
+@functools.lru_cache(maxsize=64)
+def _num_tokens_across_dp_on_device(
+    sizes: tuple[int, ...], dtype: torch.dtype
+) -> torch.Tensor:
+    """The DP token counts as a device tensor, uploaded once per distinct row.
+
+    Under EP-DP lockstep every forward pads to a shared token bucket, so a
+    handful of rows repeat on every step; consumers only read the tensor.
+    """
+    return torch.tensor(sizes, dtype=dtype).to("tpu")
+
+
 class TpuPlatform(Platform):
     # Registered via the `vllm.platform_plugins` entry point in pyproject.toml.
     _enum = PlatformEnum.OOT
@@ -430,9 +443,15 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_PUSH_EXCHANGE_TABLES",
         "MOE_FUSED_EP_PUSH_KERNEL_PLAN_TABLES",
         "MOE_FUSED_EP_PUSH_SHARED_EXPERT",
+        "MOE_FUSED_EP_PUSH_SHARED_ADD",
         "MOE_FUSED_EP_PUSH_LIGHT_PREPUSH",
         "MOE_FUSED_EP_PUSH_SINGLE_BARRIER",
+        "MOE_FUSED_EP_PUSH_SPLIT_EXCHANGE",
         "MOE_FUSED_EP_PUSH_EARLY_SCALE_SCATTER",
+        "MOE_FUSED_EP_PUSH_ONEHOT_SCALE_SLAB",
+        "MOE_FUSED_EP_PUSH_PAIR_KERNEL",
+        "MOE_FUSED_EP_PUSH_WIDE_PAIR_KERNEL",
+        "MOE_FUSED_EP_PUSH_DECODE_COMBINE",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
@@ -637,8 +656,9 @@ class TpuPlatform(Platform):
             if t.device.type == "cpu":
                 # Keep host consumers off the device stream. In particular,
                 # Engram needs these sizes before preparing the next chunk.
-                additional["tpu_num_tokens_across_dp_cpu"] = tuple(t.tolist())
-                tpu_t = t.to("tpu")
+                sizes = tuple(t.tolist())
+                additional["tpu_num_tokens_across_dp_cpu"] = sizes
+                tpu_t = _num_tokens_across_dp_on_device(sizes, t.dtype)
                 try:
                     dp_metadata.num_tokens_across_dp_cpu = tpu_t
                 except Exception:
