@@ -180,7 +180,8 @@ def _write_states(
 ) -> jax.Array:
     """The pool with each request's state written to its block; other blocks unchanged.
 
-    Rows that own no block point at block 0, the pool's null block.
+    Rows with ``block_id <= 0`` (null or inactive slots) are skipped without
+    modifying block 0.
     """
     num_reqs = block_ids.shape[0]
     if window.ndim != 3 or window.shape[0] != num_reqs:
@@ -205,13 +206,23 @@ def _write_states(
     )
 
     # Sequential dynamic_update_slice keeps the pool update in place; a whole-page
-    # scatter copies the full KV pool on TPU.
+    # scatter copies the full KV pool on TPU. Guard on block_id > 0 so inactive
+    # (-1) or null (0) sentinel rows never overwrite block 0.
     def _update_block(
         carry: jax.Array, item: tuple[jax.Array, jax.Array]
     ) -> tuple[jax.Array, None]:
         block_id, block_pages = item
-        start = (block_id * pages_per_block, *(0,) * (pool.ndim - 1))
-        return jax.lax.dynamic_update_slice(carry, block_pages, start), None
+        safe_start = (
+            jnp.maximum(block_id, 0) * pages_per_block,
+            *(0,) * (pool.ndim - 1),
+        )
+        updated = jax.lax.cond(
+            block_id > 0,
+            lambda c: jax.lax.dynamic_update_slice(c, block_pages, safe_start),
+            lambda c: c,
+            carry,
+        )
+        return updated, None
 
     updated, _ = jax.lax.scan(_update_block, pool, (block_ids, pages))
     return updated
@@ -246,7 +257,8 @@ def _state_pages(pool: jax.Array, pages_per_block: int, state_elems: int) -> int
     if state_elems > block_elems:
         raise ValueError(
             f"PLE state needs {state_elems} elements but a state block has "
-            f"{block_elems}."
+            f"{block_elems}. Pass --kv-cache-dtype auto (no extra HBM at "
+            "TP>=2) or raise --block-size (for example --block-size 384)."
         )
     return math.ceil(state_elems / page_elems)
 
@@ -288,6 +300,28 @@ def _decode_nibbles(
     return jax.lax.bitcast_convert_type(
         acc.reshape(encoded.shape[0], *item_shape), dtype
     )
+
+
+def _to_jnp_dtype(dtype: torch.dtype | jnp.dtype) -> jnp.dtype:
+    if isinstance(dtype, torch.dtype):
+        return jnp.dtype(str(dtype).removeprefix("torch."))
+    return jnp.dtype(dtype)
+
+
+def ple_state_elems(
+    pool_dtype: torch.dtype | jnp.dtype,
+    window_shape: tuple[int, int],
+    window_dtype: torch.dtype | jnp.dtype,
+    context_len: int,
+) -> int:
+    """Number of pool elements needed to store one request's PLE state."""
+    _, state_elems = _state_elems(
+        _to_jnp_dtype(pool_dtype),
+        window_shape,
+        _to_jnp_dtype(window_dtype),
+        context_len,
+    )
+    return state_elems
 
 
 def _state_elems(
